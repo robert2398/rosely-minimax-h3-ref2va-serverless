@@ -7,21 +7,17 @@ export PIP_NO_CACHE_DIR=1
 
 APP_DIR=${APP_DIR:-/workspace/vast-pyworker}
 COMFY_DIR=${COMFY_DIR:-/workspace/ComfyUI}
-
-# Pinned 2026-09-03 ComfyUI main commit with native MiniMax H3 support.
 COMFY_COMMIT=${COMFY_COMMIT:-345c9190497c82cff53e71fb4ae00d1e135a6542}
 
-PYWORKER_REPO=${PYWORKER_REPO:?PYWORKER_REPO must point to this H3 provisioning repository}
+PYWORKER_REPO=${PYWORKER_REPO:?PYWORKER_REPO must point to the H3 serverless repository}
 PYWORKER_REF=${PYWORKER_REF:-main}
 
-# Final artifact created in rosely-infrastructure.
 S3_BUCKET=${S3_BUCKET:-rosely-infrastructure}
 S3_MODEL_KEY=${S3_MODEL_KEY:-models/minimax-h3/rosely-h3-ref2va-quality-5090.zip}
 S3_CHECKSUM_KEY=${S3_CHECKSUM_KEY:-models/minimax-h3/rosely-h3-ref2va-quality-5090.zip.sha256}
 S3_REGION=${S3_REGION:-us-east-1}
 S3_ENDPOINT_URL=${S3_ENDPOINT_URL:-}
 
-# The ZIP is ~37 GiB and expands to another ~37 GiB before the ZIP is deleted.
 MIN_FREE_DISK_GB=${MIN_FREE_DISK_GB:-85}
 S3_DOWNLOAD_CONCURRENCY=${S3_DOWNLOAD_CONCURRENCY:-16}
 S3_DOWNLOAD_CHUNK_MIB=${S3_DOWNLOAD_CHUNK_MIB:-64}
@@ -95,7 +91,7 @@ check_disk_space() {
   log "Available /workspace disk: $((available_kb / 1024 / 1024)) GiB"
 
   if (( available_kb < required_kb )); then
-    fail "At least ${MIN_FREE_DISK_GB} GiB free is required. Use a larger Vast disk (120 GiB recommended)."
+    fail "At least ${MIN_FREE_DISK_GB} GiB free is required. Use a 120 GiB+ Vast disk."
   fi
 }
 
@@ -146,7 +142,7 @@ install_comfyui_preserving_models() {
 ensure_system_packages
 check_disk_space
 
-log "Cloning H3 provisioning repository"
+log "Cloning H3 serverless repository"
 rm -rf "$APP_DIR"
 git clone \
   --depth 1 \
@@ -156,7 +152,7 @@ git clone \
   "$APP_DIR"
 
 [[ -f /venv/main/bin/activate ]] \
-  || fail "/venv/main is missing. Use a recent Vast PyTorch CUDA 13.x image."
+  || fail "/venv/main is missing. Use a recent Vast PyTorch CUDA image with Blackwell support."
 
 source /venv/main/bin/activate
 
@@ -177,20 +173,19 @@ cap = torch.cuda.get_device_capability(0)
 print("GPU:", name)
 print("Compute capability:", cap)
 
-# The selected H3 checkpoint contains native NVFP4 operations and is intended
-# for Blackwell (RTX 50-series / SM 12.x).
 if cap[0] < 12:
     raise SystemExit(
-        f"Blackwell GPU required for this artifact. Detected {name}, compute capability {cap}."
+        f"Blackwell GPU required for this artifact. "
+        f"Detected {name}, compute capability {cap}."
     )
 PY
 
-log "Installing provisioning dependencies"
+log "Installing H3 application dependencies"
 python -m pip install --prefer-binary -r "$APP_DIR/requirements.txt"
 
 install_comfyui_preserving_models
 
-log "Installing ComfyUI Python requirements"
+log "Installing ComfyUI requirements"
 python -m pip install --prefer-binary -r "$COMFY_DIR/requirements.txt"
 
 mkdir -p \
@@ -205,7 +200,7 @@ mkdir -p \
 
 check_disk_space
 
-log "Downloading H3 model ZIP and checksum from S3"
+log "Downloading checksum-verified H3 model ZIP from S3"
 
 python - <<'PY'
 from __future__ import annotations
@@ -277,9 +272,7 @@ actual = digest.hexdigest()
 
 if actual != expected:
     tmp.unlink(missing_ok=True)
-    raise SystemExit(
-        f"ZIP SHA mismatch: expected {expected}, got {actual}"
-    )
+    raise SystemExit(f"ZIP SHA mismatch: expected {expected}, got {actual}")
 
 tmp.replace(model_zip)
 print(f"Verified artifact: {model_zip} ({model_zip.stat().st_size / GIB:.2f} GiB)")
@@ -288,11 +281,10 @@ PY
 log "Extracting H3 model artifact into /workspace"
 unzip -q -o "$MODEL_ZIP" -d /workspace
 
-log "Deleting ZIP after extraction to reclaim disk"
+log "Deleting ZIP after extraction"
 rm -f "$MODEL_ZIP" "$CHECKSUM_FILE"
 
 log "Validating exact H3 model pack"
-
 python - <<'PY'
 from pathlib import Path
 
@@ -326,10 +318,8 @@ for label, (path, minimum) in files.items():
         raise SystemExit(f"Missing {label}: {path}")
     size = path.stat().st_size
     if size < minimum:
-        raise SystemExit(
-            f"{label} is unexpectedly small: {size:,} bytes at {path}"
-        )
-    print(f"OK  {label}: {size / (1024**3):.2f} GiB  {path}")
+        raise SystemExit(f"{label} unexpectedly small: {size:,} bytes")
+    print(f"OK  {label}: {size / (1024**3):.2f} GiB")
 
 print("All five H3 files are present.")
 PY
@@ -350,16 +340,21 @@ done
 supervisorctl reread >/dev/null 2>&1 || true
 supervisorctl update >/dev/null 2>&1 || true
 
-log "Installing H3 ComfyUI service"
+log "Installing H3 services"
 mkdir -p /opt/rosely-h3-serverless
+
 cp "$APP_DIR/scripts/start_comfyui.sh" /opt/rosely-h3-serverless/
-chmod +x /opt/rosely-h3-serverless/start_comfyui.sh
-cp "$APP_DIR/supervisor/h3-services.conf" /etc/supervisor/conf.d/h3-services.conf
+cp "$APP_DIR/scripts/start_model_server.sh" /opt/rosely-h3-serverless/
+chmod +x /opt/rosely-h3-serverless/*.sh
+
+cp \
+  "$APP_DIR/supervisor/h3-services.conf" \
+  /etc/supervisor/conf.d/h3-services.conf
 
 supervisorctl reread
 supervisorctl update
 
-log "Waiting for H3 ComfyUI health"
+log "Waiting for H3 ComfyUI"
 comfy_ok=0
 for _ in $(seq 1 180); do
   if curl -fsS http://127.0.0.1:18189/system_stats >/dev/null 2>&1; then
@@ -371,7 +366,6 @@ for _ in $(seq 1 180); do
   if [[ "$state" == "FATAL" || "$state" == "EXITED" ]]; then
     break
   fi
-
   sleep 2
 done
 
@@ -382,15 +376,32 @@ done
   fail "H3 ComfyUI did not become healthy within 360 seconds"
 }
 
-log "H3 provisioning complete"
-supervisorctl status h3-comfyui || true
+log "Waiting for H3 model server"
+server_ok=0
+for _ in $(seq 1 180); do
+  if curl -fsS http://127.0.0.1:18288/health >/dev/null 2>&1; then
+    server_ok=1
+    break
+  fi
+
+  state=$(supervisorctl status h3-model-server 2>/dev/null | awk '{print $2}' || true)
+  if [[ "$state" == "FATAL" || "$state" == "EXITED" ]]; then
+    break
+  fi
+  sleep 2
+done
+
+(( server_ok == 1 )) || {
+  supervisorctl status || true
+  nvidia-smi || true
+  tail -250 /var/log/portal/comfyui.log 2>/dev/null || true
+  tail -250 /var/log/portal/model-server.log 2>/dev/null || true
+  fail "H3 model server did not become healthy within 360 seconds"
+}
+
+log "Provisioning complete"
+supervisorctl status h3-comfyui h3-model-server || true
+curl -fsS http://127.0.0.1:18288/health || true
+echo
 nvidia-smi || true
-
-log "Installed H3 files"
-find "$COMFY_DIR/models" \
-  -type f \
-  \( -name "*.safetensors" -o -name "*.gguf" \) \
-  -printf "%s %p\n" \
-  | sort -n
-
 df -h /workspace

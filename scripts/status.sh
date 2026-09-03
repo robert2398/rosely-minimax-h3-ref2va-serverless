@@ -2,15 +2,19 @@
 set -euo pipefail
 
 echo "=== Supervisor ==="
-supervisorctl status h3-comfyui || true
+supervisorctl status h3-comfyui h3-model-server || true
 
 echo
 echo "=== GPU ==="
 nvidia-smi || true
 
 echo
-echo "=== ComfyUI health ==="
+echo "=== ComfyUI ==="
 curl -fsS http://127.0.0.1:18189/system_stats | jq . || true
+
+echo
+echo "=== H3 model server ==="
+curl -fsS http://127.0.0.1:18288/health | jq . || true
 
 echo
 echo "=== H3 model files ==="

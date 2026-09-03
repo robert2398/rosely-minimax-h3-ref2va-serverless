@@ -1,16 +1,18 @@
-# Rosely MiniMax H3 Ref2VA — Vast provisioning
+# Rosely MiniMax H3 Ref2VA — Vast Serverless
 
-This repository is the provisioning layer for the **quality-first MiniMax H3 Ref2VA stack on RTX 5090 / Blackwell**.
+Quality-first MiniMax H3 Ref2VA deployment for RTX 5090 / Blackwell.
 
-It is adapted from the existing `rosely-wan22-v3-serverless` deployment pattern: pinned ComfyUI, S3-hosted models, Supervisor-managed ComfyUI, fail-fast hardware checks, and deterministic file validation.
+## Runtime
 
-## Final model pack
+The worker runs:
 
-The provisioner expects one S3 ZIP:
+- ComfyUI: `127.0.0.1:18189`
+- H3 FastAPI model server: `127.0.0.1:18288`
+- Serverless route: `POST /generate/sync`
 
-`S3://rosely-infrastructure/models/minimax-h3/rosely-h3-ref2va-quality-5090.zip`
+The API accepts a reference image + prompt and returns a **private S3 presigned URL** for the generated video.
 
-with this layout:
+## Models
 
 ```text
 ComfyUI/models/
@@ -25,92 +27,149 @@ ComfyUI/models/
     └── HMNSFW-AIO-V2.5.safetensors
 ```
 
-A sibling SHA-256 file is required:
+The S3 model artifact is expected at:
 
-`S3://rosely-infrastructure/models/minimax-h3/rosely-h3-ref2va-quality-5090.zip.sha256`
+```text
+s3://rosely-infrastructure/models/minimax-h3/rosely-h3-ref2va-quality-5090.zip
+s3://rosely-infrastructure/models/minimax-h3/rosely-h3-ref2va-quality-5090.zip.sha256
+```
 
-The provisioner downloads the ZIP with multipart S3 transfer, verifies SHA-256, extracts into `/workspace`, deletes the ZIP to reclaim disk, validates the five expected files, and then starts ComfyUI.
-
-## Hardware target
-
-This artifact is intentionally **5090 / Blackwell-only**.
-
-The selected quality-first diffusion checkpoint uses native NVFP4 operations. `provision.sh` rejects GPUs with CUDA compute capability major < 12 so a 4090 is not accidentally assigned to this workergroup.
-
-Recommended first worker:
-
-- RTX 5090 32 GB
-- 64 GB+ system RAM
-- **120 GB worker disk**
-- recent Vast PyTorch image with CUDA 13.x
-
-The model ZIP and extracted files coexist briefly, so a 100 GB disk can be uncomfortably tight depending on the base image. 120 GB is safer.
-
-## Vast environment
-
-Push this repository to GitHub, then configure:
+## Vast environment variables
 
 ```text
 SERVERLESS=true
-PYWORKER_REPO=https://github.com/YOUR_GITHUB_USER/rosely-h3-ref2va-serverless.git
+
+PYWORKER_REPO=https://github.com/robert2398/rosely-minimax-h3-ref2va-serverless.git
 PYWORKER_REF=main
-PROVISIONING_SCRIPT=https://raw.githubusercontent.com/YOUR_GITHUB_USER/rosely-h3-ref2va-serverless/main/provision.sh
+PROVISIONING_SCRIPT=https://raw.githubusercontent.com/robert2398/rosely-minimax-h3-ref2va-serverless/main/provision.sh
+
+AWS_ACCESS_KEY_ID=<Vast secret>
+AWS_SECRET_ACCESS_KEY=<Vast secret>
 
 S3_BUCKET=rosely-infrastructure
 S3_REGION=us-east-1
 S3_MODEL_KEY=models/minimax-h3/rosely-h3-ref2va-quality-5090.zip
 S3_CHECKSUM_KEY=models/minimax-h3/rosely-h3-ref2va-quality-5090.zip.sha256
+
+S3_OUTPUT_BUCKET=rosely-infrastructure
+S3_OUTPUT_PREFIX=generated/minimax-h3
+S3_PRESIGNED_URL_EXPIRES_SECONDS=3600
+
 MIN_FREE_DISK_GB=85
+GENERATION_TIMEOUT_SECONDS=3600
+COMFYUI_ARGS=
 ```
 
-Configure these as **Vast secrets**, not repository variables committed to Git:
+Keep the AWS values in Vast secrets. Do not commit them.
 
-```text
-AWS_ACCESS_KEY_ID
-AWS_SECRET_ACCESS_KEY
+## Recommended worker
+
+- RTX 5090 32 GB
+- 64 GB+ RAM
+- 120 GB+ disk
+- Recent PyTorch/CUDA image with Blackwell/NVFP4 support
+
+The provisioner rejects non-Blackwell GPUs.
+
+## API request
+
+```json
+{
+  "input": {
+    "request_id": "video_123",
+    "input_image_url": "https://example.com/reference.png",
+    "prompt": "Natural coherent motion while preserving identity and pose consistency.",
+    "width": 480,
+    "height": 864,
+    "duration_seconds": 5,
+    "steps": 20,
+    "scheduler": "normal",
+    "ref_image_size": "match",
+    "lora_strength": 0.7,
+    "include_audio": true
+  }
+}
 ```
 
-If temporary AWS credentials are used, also set `AWS_SESSION_TOKEN`.
+The server automatically adds `<Picture 1>` when missing. With a non-zero motion-LoRA strength it also adds `hmmotion` unless `auto_hmmotion_trigger=false`.
 
-## ComfyUI
+H3 length is snapped to the model's `17k+5` frame grid at 24 fps:
 
-Pinned commit:
+- ~5 s → 124 frames
+- ~10 s → 243 frames
+- ~15 s → 362 frames
 
-```text
-345c9190497c82cff53e71fb4ae00d1e135a6542
+Width and height must be multiples of 32. The server caps the generation canvas to the 1344×768 pixel area.
+
+## Successful response
+
+Vast wraps the worker response. `result["response"]` contains data similar to:
+
+```json
+{
+  "request_id": "video_123",
+  "status": "completed",
+  "output_url": "https://rosely-infrastructure.s3.amazonaws.com/...",
+  "output_url_expires_in_seconds": 3600,
+  "s3_uri": "s3://rosely-infrastructure/generated/minimax-h3/video_123.mp4",
+  "size_bytes": 12345678,
+  "generation_seconds": 184.2,
+  "seed": 123456789,
+  "width": 480,
+  "height": 864,
+  "length": 124,
+  "fps": 24
+}
 ```
 
-ComfyUI listens only locally:
+The S3 bucket remains private. `output_url` is a temporary signed GET URL.
 
-```text
-127.0.0.1:18189
-```
+## Deployment checks
 
-The provisioner uses default ComfyUI memory management first. Do not start with `--disable-smart-memory`; the selected H3 checkpoint relies on ComfyUI/DynamicVRAM to stage large components efficiently.
-
-To force low-VRAM mode on a problematic host:
-
-```text
-COMFYUI_ARGS=--lowvram
-```
-
-## After provisioning
-
-Useful checks inside a worker:
+Inside a worker:
 
 ```bash
-supervisorctl status h3-comfyui
+supervisorctl status h3-comfyui h3-model-server
 curl -s http://127.0.0.1:18189/system_stats | jq .
+curl -s http://127.0.0.1:18288/health | jq .
 nvidia-smi
-find /workspace/ComfyUI/models -type f -name '*.safetensors' -printf '%s %p\n' | sort -n
 ```
 
-## Scope of this repository
+Logs:
 
-This package is the **provisioning/runtime foundation**. It intentionally does not yet hard-code a `/generate/sync` H3 API workflow.
+```bash
+tail -f /var/log/portal/comfyui.log
+tail -f /var/log/portal/model-server.log
+```
 
-The previous Wan repository's `model_server.py` is tightly coupled to Wan-specific node IDs and routing, so copying it directly would be unsafe. The next step is to validate the official MiniMax H3 Ref2VA workflow with this exact hybrid checkpoint + HMNSFW V2.5, export the tested workflow in ComfyUI API format, and then add the H3-specific model server on top.
+## Test after deployment
 
-## License note
+Notebook:
 
-Before production deployment, review the MiniMax H3 Community License and the license/NOTICE of the hybrid derivative. The hybrid model card states territorial restrictions, including exclusion of the United States, EU, UK, and Republic of Korea from its defined applicable territory. Your current S3 bucket is in `us-east-1`, so this deserves review before treating the setup as a production distribution path.
+```text
+notebooks/test_vast_h3_serverless.ipynb
+```
+
+Terminal client:
+
+```bash
+pip install "vastai[serverless]"
+export VAST_API_KEY='...'
+export VAST_ENDPOINT_NAME='rosely-minimax-h3-ref2va'
+export INPUT_IMAGE_URL='https://.../reference.png'
+python test_vast_endpoint.py
+```
+
+## Workflow basis
+
+`workflows/minimax_h3_ref2va_api.json` is a ComfyUI API-format graph using:
+
+`CLIPLoader → UNETLoader → HMNSFW LoRA → MiniMaxH3SigmaShift → MiniMaxH3ReferenceToVideo → BasicGuider → res_multistep → joint video/audio decode → SaveVideo`
+
+It uses the flat autogrow API input key:
+
+```text
+ref_images.ref_image_0
+```
+
+for the reference image.
