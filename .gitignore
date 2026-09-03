@@ -1,0 +1,7 @@
+.env
+*.zip
+*.safetensors
+*.gguf
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,48 @@
+{
+  "artifact": {
+    "bucket": "rosely-infrastructure",
+    "region": "us-east-1",
+    "key": "models/minimax-h3/rosely-h3-ref2va-quality-5090.zip",
+    "checksum_key": "models/minimax-h3/rosely-h3-ref2va-quality-5090.zip.sha256",
+    "zip_root": "ComfyUI/"
+  },
+  "target_gpu": {
+    "recommended": "NVIDIA GeForce RTX 5090 32GB",
+    "architecture": "Blackwell",
+    "minimum_compute_capability_major_enforced_by_provisioner": 12
+  },
+  "files": [
+    {
+      "path": "ComfyUI/models/diffusion_models/minimax_h3_ref2va_pruned_hybrid_ffn_nvfp4_blackwell.safetensors",
+      "source": "https://huggingface.co/abakanai/Minimax_h3_hybrid",
+      "purpose": "quality-first Ref2VA diffusion model",
+      "published_size": "16.38 GiB"
+    },
+    {
+      "path": "ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "source": "https://huggingface.co/Comfy-Org/MiniMax-H3",
+      "purpose": "H3 Qwen3-VL text/reference encoder",
+      "published_size": "15.7 GB"
+    },
+    {
+      "path": "ComfyUI/models/vae/minimax_h3_video_vae_fp16.safetensors",
+      "source": "https://huggingface.co/Comfy-Org/MiniMax-H3",
+      "purpose": "video VAE",
+      "published_size": "5.21 GB"
+    },
+    {
+      "path": "ComfyUI/models/vae/minimax_h3_audio_vae_fp32.safetensors",
+      "source": "https://huggingface.co/Comfy-Org/MiniMax-H3",
+      "purpose": "audio VAE",
+      "published_size": "605 MB"
+    },
+    {
+      "path": "ComfyUI/models/loras/HMNSFW-AIO-V2.5.safetensors",
+      "source": "https://huggingface.co/Hearmeman/minimax-h3-loras",
+      "purpose": "HMNSFW V2.5 motion/action LoRA",
+      "published_size": "86 MB",
+      "trigger": "hmmotion",
+      "published_strength": "0.5-0.9"
+    }
+  ]
+}
