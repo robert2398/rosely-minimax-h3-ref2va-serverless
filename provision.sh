@@ -4,6 +4,11 @@ set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 export PIP_NO_CACHE_DIR=1
+export PYTHONUNBUFFERED=1
+
+mkdir -p /var/log/portal
+touch /var/log/portal/h3-provision.log
+exec > >(tee -a /var/log/portal/h3-provision.log) 2>&1
 
 APP_DIR=${APP_DIR:-/workspace/vast-pyworker}
 COMFY_DIR=${COMFY_DIR:-/workspace/ComfyUI}
@@ -46,6 +51,11 @@ on_error() {
   exit "$exit_code"
 }
 trap 'on_error $LINENO' ERR
+
+log "Rosely MiniMax H3 provisioning STARTED"
+log "Repo: ${PYWORKER_REPO} @ ${PYWORKER_REF}"
+log "S3: s3://${S3_BUCKET}/${S3_MODEL_KEY}"
+log "Region: ${S3_REGION}"
 
 ensure_system_packages() {
   local packages=()
@@ -145,11 +155,14 @@ check_disk_space
 log "Cloning H3 serverless repository"
 rm -rf "$APP_DIR"
 git clone \
+  --progress \
   --depth 1 \
   --single-branch \
   --branch "$PYWORKER_REF" \
   "$PYWORKER_REPO" \
   "$APP_DIR"
+
+[[ -f "$APP_DIR/worker.py" ]] || fail "worker.py missing from PYWORKER_REPO"
 
 [[ -f /venv/main/bin/activate ]] \
   || fail "/venv/main is missing. Use a recent Vast PyTorch CUDA image with Blackwell support."
@@ -157,7 +170,7 @@ git clone \
 source /venv/main/bin/activate
 
 log "Checking CUDA and Blackwell GPU"
-python - <<'PY'
+python -u - <<'PY'
 import torch
 
 print("Torch:", torch.__version__)
@@ -200,9 +213,9 @@ mkdir -p \
 
 check_disk_space
 
-log "Downloading checksum-verified H3 model ZIP from S3"
+log "STEP: Downloading checksum-verified H3 model ZIP from S3 (live progress every ~5s)"
 
-python - <<'PY'
+python -u - <<'PY'
 from __future__ import annotations
 
 import hashlib
@@ -260,14 +273,63 @@ transfer = TransferConfig(
 tmp = model_zip.with_suffix(model_zip.suffix + ".part")
 tmp.unlink(missing_ok=True)
 
-print(f"Downloading with {concurrency} workers, {chunk_mib} MiB chunks...")
-client.download_file(bucket, model_key, str(tmp), Config=transfer)
+import threading
+import time
 
-print("Verifying SHA-256...")
+class Progress:
+    def __init__(self, total: int):
+        self.total = total
+        self.seen = 0
+        self.started = time.monotonic()
+        self.last_print = 0.0
+        self.lock = threading.Lock()
+
+    def __call__(self, amount: int):
+        with self.lock:
+            self.seen += amount
+            now = time.monotonic()
+            if self.seen >= self.total or now - self.last_print >= 5.0:
+                elapsed = max(0.001, now - self.started)
+                speed = self.seen / elapsed
+                remaining = max(0, self.total - self.seen)
+                eta = remaining / speed if speed else 0
+                pct = self.seen / self.total * 100 if self.total else 0
+                print(
+                    f"[S3] {pct:6.2f}% | "
+                    f"{self.seen/GIB:6.2f}/{self.total/GIB:6.2f} GiB | "
+                    f"{speed/MIB:7.1f} MiB/s | ETA {eta:6.0f}s",
+                    flush=True,
+                )
+                self.last_print = now
+
+print(
+    f"[S3] Downloading with {concurrency} workers, {chunk_mib} MiB chunks...",
+    flush=True,
+)
+client.download_file(
+    bucket, model_key, str(tmp), Config=transfer, Callback=Progress(size)
+)
+
+print("[SHA256] Verifying downloaded ZIP...", flush=True)
 digest = hashlib.sha256()
+verified = 0
+verify_started = time.monotonic()
+last_verify = 0.0
 with tmp.open("rb") as handle:
     for block in iter(lambda: handle.read(32 * MIB), b""):
         digest.update(block)
+        verified += len(block)
+        now = time.monotonic()
+        if verified >= size or now - last_verify >= 5.0:
+            elapsed = max(0.001, now - verify_started)
+            pct = verified / size * 100 if size else 0
+            print(
+                f"[SHA256] {pct:6.2f}% | "
+                f"{verified/GIB:6.2f}/{size/GIB:6.2f} GiB | "
+                f"{verified/elapsed/MIB:7.1f} MiB/s",
+                flush=True,
+            )
+            last_verify = now
 actual = digest.hexdigest()
 
 if actual != expected:
@@ -278,14 +340,20 @@ tmp.replace(model_zip)
 print(f"Verified artifact: {model_zip} ({model_zip.stat().st_size / GIB:.2f} GiB)")
 PY
 
-log "Extracting H3 model artifact into /workspace"
-unzip -q -o "$MODEL_ZIP" -d /workspace
+log "STEP: Extracting H3 model artifact into /workspace"
+ls -lh "$MODEL_ZIP"
+df -h /workspace
+unzip -o "$MODEL_ZIP" -d /workspace
+
+log "Extraction finished"
+du -sh "$COMFY_DIR/models" || true
+df -h /workspace
 
 log "Deleting ZIP after extraction"
 rm -f "$MODEL_ZIP" "$CHECKSUM_FILE"
 
 log "Validating exact H3 model pack"
-python - <<'PY'
+python -u - <<'PY'
 from pathlib import Path
 
 base = Path("/workspace/ComfyUI/models")
@@ -399,9 +467,11 @@ done
   fail "H3 model server did not become healthy within 360 seconds"
 }
 
-log "Provisioning complete"
+log "PROVISIONING COMPLETE"
 supervisorctl status h3-comfyui h3-model-server || true
 curl -fsS http://127.0.0.1:18288/health || true
 echo
 nvidia-smi || true
 df -h /workspace
+
+log "Dedicated log: /var/log/portal/h3-provision.log"
