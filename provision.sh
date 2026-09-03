@@ -17,22 +17,32 @@ COMFY_COMMIT=${COMFY_COMMIT:-345c9190497c82cff53e71fb4ae00d1e135a6542}
 PYWORKER_REPO=${PYWORKER_REPO:?PYWORKER_REPO must point to the H3 serverless repository}
 PYWORKER_REF=${PYWORKER_REF:-main}
 
-S3_BUCKET=${S3_BUCKET:-rosely-infrastructure}
-S3_MODEL_KEY=${S3_MODEL_KEY:-models/minimax-h3/rosely-h3-ref2va-quality-5090.zip}
-S3_CHECKSUM_KEY=${S3_CHECKSUM_KEY:-models/minimax-h3/rosely-h3-ref2va-quality-5090.zip.sha256}
-S3_REGION=${S3_REGION:-us-east-1}
-S3_ENDPOINT_URL=${S3_ENDPOINT_URL:-}
+# ---------------------------------------------------------------------------
+# Namespaced H3 storage variables.
+#
+# IMPORTANT:
+# We intentionally DO NOT read generic S3_BUCKET / S3_REGION / S3_MODEL_KEY
+# variables. Vast's runtime may provide or source generic S3 variables from
+# /etc/environment or /workspace/.env. Using a Rosely-specific namespace
+# prevents those values from overriding this deployment.
+# ---------------------------------------------------------------------------
+H3_S3_BUCKET=${ROSELY_H3_S3_BUCKET:?ROSELY_H3_S3_BUCKET is required}
+H3_S3_MODEL_KEY=${ROSELY_H3_S3_MODEL_KEY:-models/minimax-h3/rosely-h3-ref2va-quality-5090.zip}
+H3_S3_CHECKSUM_KEY=${ROSELY_H3_S3_CHECKSUM_KEY:-models/minimax-h3/rosely-h3-ref2va-quality-5090.zip.sha256}
+H3_S3_REGION=${ROSELY_H3_S3_REGION:-us-east-1}
+H3_S3_ENDPOINT_URL=${ROSELY_H3_S3_ENDPOINT_URL:-}
+
+H3_S3_DOWNLOAD_CONCURRENCY=${ROSELY_H3_S3_DOWNLOAD_CONCURRENCY:-16}
+H3_S3_DOWNLOAD_CHUNK_MIB=${ROSELY_H3_S3_DOWNLOAD_CHUNK_MIB:-64}
 
 MIN_FREE_DISK_GB=${MIN_FREE_DISK_GB:-85}
-S3_DOWNLOAD_CONCURRENCY=${S3_DOWNLOAD_CONCURRENCY:-16}
-S3_DOWNLOAD_CHUNK_MIB=${S3_DOWNLOAD_CHUNK_MIB:-64}
 
 MODEL_ZIP=/workspace/rosely-h3-ref2va-quality-5090.zip
 CHECKSUM_FILE=/workspace/rosely-h3-ref2va-quality-5090.zip.sha256
 
 export APP_DIR COMFY_DIR
-export S3_BUCKET S3_MODEL_KEY S3_CHECKSUM_KEY S3_REGION S3_ENDPOINT_URL
-export S3_DOWNLOAD_CONCURRENCY S3_DOWNLOAD_CHUNK_MIB
+export H3_S3_BUCKET H3_S3_MODEL_KEY H3_S3_CHECKSUM_KEY H3_S3_REGION
+export H3_S3_ENDPOINT_URL H3_S3_DOWNLOAD_CONCURRENCY H3_S3_DOWNLOAD_CHUNK_MIB
 export MODEL_ZIP CHECKSUM_FILE
 
 log() {
@@ -54,8 +64,12 @@ trap 'on_error $LINENO' ERR
 
 log "Rosely MiniMax H3 provisioning STARTED"
 log "Repo: ${PYWORKER_REPO} @ ${PYWORKER_REF}"
-log "S3: s3://${S3_BUCKET}/${S3_MODEL_KEY}"
-log "Region: ${S3_REGION}"
+log "H3 S3: s3://${H3_S3_BUCKET}/${H3_S3_MODEL_KEY}"
+log "Region: ${H3_S3_REGION}"
+
+if [[ -n "${S3_BUCKET:-}" ]]; then
+  log "NOTICE: legacy S3_BUCKET is present in the runtime environment and is intentionally ignored."
+fi
 
 ensure_system_packages() {
   local packages=()
@@ -220,6 +234,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
+import time
 from pathlib import Path
 
 import boto3
@@ -229,13 +245,17 @@ from botocore.config import Config
 MIB = 1024 * 1024
 GIB = 1024 * 1024 * 1024
 
-bucket = os.environ["S3_BUCKET"]
-model_key = os.environ["S3_MODEL_KEY"]
-checksum_key = os.environ["S3_CHECKSUM_KEY"]
-region = os.environ.get("S3_REGION", "us-east-1")
-endpoint_url = os.environ.get("S3_ENDPOINT_URL") or None
-concurrency = max(1, int(os.environ.get("S3_DOWNLOAD_CONCURRENCY", "16")))
-chunk_mib = max(16, int(os.environ.get("S3_DOWNLOAD_CHUNK_MIB", "64")))
+bucket = os.environ["H3_S3_BUCKET"]
+model_key = os.environ["H3_S3_MODEL_KEY"]
+checksum_key = os.environ["H3_S3_CHECKSUM_KEY"]
+region = os.environ.get("H3_S3_REGION", "us-east-1")
+endpoint_url = os.environ.get("H3_S3_ENDPOINT_URL") or None
+concurrency = max(
+    1, int(os.environ.get("H3_S3_DOWNLOAD_CONCURRENCY", "16"))
+)
+chunk_mib = max(
+    16, int(os.environ.get("H3_S3_DOWNLOAD_CHUNK_MIB", "64"))
+)
 model_zip = Path(os.environ["MODEL_ZIP"])
 checksum_file = Path(os.environ["CHECKSUM_FILE"])
 
@@ -253,15 +273,17 @@ client = boto3.client(
     ),
 )
 
+print(f"[S3] HEAD s3://{bucket}/{model_key}", flush=True)
 head = client.head_object(Bucket=bucket, Key=model_key)
 size = int(head["ContentLength"])
-print(f"S3 model artifact: s3://{bucket}/{model_key}")
-print(f"Artifact size: {size / GIB:.2f} GiB")
+print(f"[S3] Artifact size: {size / GIB:.2f} GiB", flush=True)
 
+print(f"[S3] Fetching checksum s3://{bucket}/{checksum_key}", flush=True)
 checksum_obj = client.get_object(Bucket=bucket, Key=checksum_key)
 checksum_text = checksum_obj["Body"].read().decode("utf-8").strip()
 checksum_file.write_text(checksum_text + "\n", encoding="utf-8")
 expected = checksum_text.split()[0].lower()
+print(f"[S3] Expected SHA-256: {expected}", flush=True)
 
 transfer = TransferConfig(
     multipart_threshold=64 * MIB,
@@ -273,8 +295,6 @@ transfer = TransferConfig(
 tmp = model_zip.with_suffix(model_zip.suffix + ".part")
 tmp.unlink(missing_ok=True)
 
-import threading
-import time
 
 class Progress:
     def __init__(self, total: int):
@@ -302,12 +322,17 @@ class Progress:
                 )
                 self.last_print = now
 
+
 print(
     f"[S3] Downloading with {concurrency} workers, {chunk_mib} MiB chunks...",
     flush=True,
 )
 client.download_file(
-    bucket, model_key, str(tmp), Config=transfer, Callback=Progress(size)
+    bucket,
+    model_key,
+    str(tmp),
+    Config=transfer,
+    Callback=Progress(size),
 )
 
 print("[SHA256] Verifying downloaded ZIP...", flush=True)
@@ -315,6 +340,7 @@ digest = hashlib.sha256()
 verified = 0
 verify_started = time.monotonic()
 last_verify = 0.0
+
 with tmp.open("rb") as handle:
     for block in iter(lambda: handle.read(32 * MIB), b""):
         digest.update(block)
@@ -330,14 +356,21 @@ with tmp.open("rb") as handle:
                 flush=True,
             )
             last_verify = now
+
 actual = digest.hexdigest()
 
 if actual != expected:
     tmp.unlink(missing_ok=True)
-    raise SystemExit(f"ZIP SHA mismatch: expected {expected}, got {actual}")
+    raise SystemExit(
+        f"ZIP SHA mismatch: expected {expected}, got {actual}"
+    )
 
 tmp.replace(model_zip)
-print(f"Verified artifact: {model_zip} ({model_zip.stat().st_size / GIB:.2f} GiB)")
+print(
+    f"Verified artifact: {model_zip} "
+    f"({model_zip.stat().st_size / GIB:.2f} GiB)",
+    flush=True,
+)
 PY
 
 log "STEP: Extracting H3 model artifact into /workspace"

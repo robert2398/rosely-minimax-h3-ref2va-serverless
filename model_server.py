@@ -37,7 +37,9 @@ OUTPUT_DIR = Path(os.getenv("COMFY_OUTPUT_DIR", "/workspace/ComfyUI/output"))
 
 GENERATION_TIMEOUT = int(os.getenv("GENERATION_TIMEOUT_SECONDS", "3600"))
 KEEP_LOCAL_OUTPUTS = os.getenv("KEEP_LOCAL_OUTPUTS", "false").lower() == "true"
-MAX_INPUT_IMAGE_BYTES = int(os.getenv("MAX_INPUT_IMAGE_BYTES", str(30 * 1024 * 1024)))
+MAX_INPUT_IMAGE_BYTES = int(
+    os.getenv("MAX_INPUT_IMAGE_BYTES", str(30 * 1024 * 1024))
+)
 
 BASE_MODEL = "minimax_h3_ref2va_pruned_hybrid_ffn_nvfp4_blackwell.safetensors"
 TEXT_ENCODER = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
@@ -115,7 +117,9 @@ def _load_base_workflow() -> dict[str, Any]:
             )
 
     if workflow["8"]["inputs"].get("ref_images.ref_image_0") != ["7", 0]:
-        raise RuntimeError("Workflow reference image must route LoadImage -> H3 ref_image_0")
+        raise RuntimeError(
+            "Workflow reference image must route LoadImage -> H3 ref_image_0"
+        )
 
     return workflow
 
@@ -181,12 +185,9 @@ def _prepare_prompt(data: dict[str, Any], lora_strength: float) -> str:
     if not prompt:
         raise HTTPException(status_code=422, detail="prompt is required")
 
-    # Ref2VA references must be named in the prompt.
     if "<Picture 1>" not in prompt:
         prompt = f"<Picture 1> {prompt}"
 
-    # HMNSFW V2.5 publishes `hmmotion` as its trigger. Make it automatic
-    # while still allowing callers to disable this behavior.
     auto_trigger = bool(data.get("auto_hmmotion_trigger", True))
     if lora_strength > 0 and auto_trigger and "hmmotion" not in prompt.lower():
         prompt = f"hmmotion {prompt}"
@@ -203,25 +204,33 @@ async def _download_input_image(data: dict[str, Any], request_id: str) -> str:
 
     if encoded:
         if not isinstance(encoded, str):
-            raise HTTPException(status_code=422, detail="input_image_base64 must be a string")
+            raise HTTPException(
+                status_code=422,
+                detail="input_image_base64 must be a string",
+            )
         if encoded.startswith("data:"):
             encoded = encoded.split(",", 1)[1]
         try:
             raw = base64.b64decode(encoded, validate=False)
         except Exception as exc:
             raise HTTPException(
-                status_code=422, detail=f"Invalid input_image_base64: {exc}"
+                status_code=422,
+                detail=f"Invalid input_image_base64: {exc}",
             ) from exc
     elif url:
         headers = data.get("input_image_headers") or {}
         timeout = httpx.Timeout(120.0, connect=30.0)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+        ) as client:
             try:
                 response = await client.get(str(url), headers=headers)
                 response.raise_for_status()
             except httpx.HTTPError as exc:
                 raise HTTPException(
-                    status_code=422, detail=f"Could not download input image: {exc}"
+                    status_code=422,
+                    detail=f"Could not download input image: {exc}",
                 ) from exc
             raw = response.content
     else:
@@ -233,7 +242,10 @@ async def _download_input_image(data: dict[str, Any], request_id: str) -> str:
     if len(raw) > MAX_INPUT_IMAGE_BYTES:
         raise HTTPException(
             status_code=413,
-            detail=f"Input image exceeds {MAX_INPUT_IMAGE_BYTES // (1024 * 1024)} MiB limit",
+            detail=(
+                f"Input image exceeds "
+                f"{MAX_INPUT_IMAGE_BYTES // (1024 * 1024)} MiB limit"
+            ),
         )
 
     target = INPUT_DIR / f"h3_{request_id}.png"
@@ -242,7 +254,10 @@ async def _download_input_image(data: dict[str, Any], request_id: str) -> str:
             image = image.convert("RGB")
             image.save(target, format="PNG")
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Invalid input image: {exc}") from exc
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid input image: {exc}",
+        ) from exc
 
     return target.name
 
@@ -262,7 +277,10 @@ def _patch_workflow(
 
     steps = int(data.get("steps", 20))
     if steps < 4 or steps > 50:
-        raise HTTPException(status_code=422, detail="steps must be between 4 and 50")
+        raise HTTPException(
+            status_code=422,
+            detail="steps must be between 4 and 50",
+        )
 
     scheduler = str(data.get("scheduler", "normal"))
     if scheduler not in VALID_SCHEDULERS:
@@ -372,11 +390,17 @@ async def _submit_and_wait(
             raise HTTPException(status_code=502, detail=body)
 
         prompt_id = body["prompt_id"]
-        logger.info("request=%s comfy_prompt_id=%s submitted", request_id, prompt_id)
+        logger.info(
+            "request=%s comfy_prompt_id=%s submitted",
+            request_id,
+            prompt_id,
+        )
 
         deadline = time.monotonic() + GENERATION_TIMEOUT
         while time.monotonic() < deadline:
-            history_response = await client.get(f"{COMFY_URL}/history/{prompt_id}")
+            history_response = await client.get(
+                f"{COMFY_URL}/history/{prompt_id}"
+            )
             history_response.raise_for_status()
             history = history_response.json()
 
@@ -399,7 +423,10 @@ async def _submit_and_wait(
         try:
             await client.post(f"{COMFY_URL}/interrupt")
         except Exception:
-            logger.exception("Failed to interrupt timed-out prompt %s", prompt_id)
+            logger.exception(
+                "Failed to interrupt timed-out prompt %s",
+                prompt_id,
+            )
 
         raise HTTPException(
             status_code=504,
@@ -440,7 +467,6 @@ def _resolve_output(
         if path.is_file():
             return path, metadata
 
-    # SaveVideo uses filename_prefix video/h3/{request_id}.
     request_candidates = sorted(
         (
             p
@@ -460,31 +486,49 @@ def _resolve_output(
 
     raise HTTPException(
         status_code=500,
-        detail="ComfyUI completed but the request-specific video file was not found",
+        detail=(
+            "ComfyUI completed but the request-specific video file was not found"
+        ),
     )
 
 
 def _s3_output_config() -> tuple[str, str, int]:
-    bucket = os.getenv("S3_OUTPUT_BUCKET") or os.getenv("S3_BUCKET")
+    bucket = (
+        os.getenv("ROSELY_H3_OUTPUT_BUCKET")
+        or os.getenv("ROSELY_H3_S3_BUCKET")
+    )
     if not bucket:
-        raise RuntimeError("S3_OUTPUT_BUCKET or S3_BUCKET must be configured")
+        raise RuntimeError(
+            "ROSELY_H3_OUTPUT_BUCKET or ROSELY_H3_S3_BUCKET must be configured"
+        )
 
-    prefix = os.getenv("S3_OUTPUT_PREFIX", "generated/minimax-h3").strip("/")
-    expires = int(os.getenv("S3_PRESIGNED_URL_EXPIRES_SECONDS", "3600"))
+    prefix = os.getenv(
+        "ROSELY_H3_OUTPUT_PREFIX",
+        "generated/minimax-h3",
+    ).strip("/")
+
+    expires = int(
+        os.getenv(
+            "ROSELY_H3_PRESIGNED_URL_EXPIRES_SECONDS",
+            "3600",
+        )
+    )
     if expires < 60 or expires > 604800:
         raise RuntimeError(
-            "S3_PRESIGNED_URL_EXPIRES_SECONDS must be between 60 and 604800"
+            "ROSELY_H3_PRESIGNED_URL_EXPIRES_SECONDS must be "
+            "between 60 and 604800"
         )
+
     return bucket, prefix, expires
 
 
 def _s3_client():
-    # boto3 uses the standard AWS credential chain, including:
+    # boto3 still uses the standard AWS credential chain:
     # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN.
     return boto3.client(
         "s3",
-        endpoint_url=os.getenv("S3_ENDPOINT_URL") or None,
-        region_name=os.getenv("S3_REGION", "us-east-1"),
+        endpoint_url=os.getenv("ROSELY_H3_S3_ENDPOINT_URL") or None,
+        region_name=os.getenv("ROSELY_H3_S3_REGION", "us-east-1"),
     )
 
 
@@ -518,7 +562,11 @@ def _upload_and_presign(
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    missing = [name for name, path in EXPECTED_MODELS.items() if not path.is_file()]
+    missing = [
+        name
+        for name, path in EXPECTED_MODELS.items()
+        if not path.is_file()
+    ]
 
     comfy_ok = False
     try:
@@ -528,7 +576,11 @@ async def health() -> dict[str, Any]:
     except Exception:
         comfy_ok = False
 
-    bucket = os.getenv("S3_OUTPUT_BUCKET") or os.getenv("S3_BUCKET")
+    bucket = (
+        os.getenv("ROSELY_H3_OUTPUT_BUCKET")
+        or os.getenv("ROSELY_H3_S3_BUCKET")
+    )
+
     if missing or not comfy_ok or not bucket:
         raise HTTPException(
             status_code=503,
@@ -545,7 +597,7 @@ async def health() -> dict[str, Any]:
         "workflow": WORKFLOW_PATH.name,
         "s3_output_bucket": bucket,
         "s3_output_prefix": os.getenv(
-            "S3_OUTPUT_PREFIX",
+            "ROSELY_H3_OUTPUT_PREFIX",
             "generated/minimax-h3",
         ),
     }
@@ -554,15 +606,17 @@ async def health() -> dict[str, Any]:
 @app.post("/generate/sync")
 async def generate_sync(envelope: GenerateEnvelope) -> dict[str, Any]:
     data = _payload(envelope)
-    request_id = str(data.get("request_id") or f"h3_{uuid.uuid4().hex}")
+    request_id = str(
+        data.get("request_id") or f"h3_{uuid.uuid4().hex}"
+    )
 
     image_name: str | None = None
     output_path: Path | None = None
 
     async with generation_lock:
         started = time.monotonic()
+
         try:
-            # Fail before expensive inference if output storage is not configured.
             _s3_output_config()
 
             image_name = await _download_input_image(data, request_id)
@@ -594,10 +648,16 @@ async def generate_sync(envelope: GenerateEnvelope) -> dict[str, Any]:
                     request_id,
                 )
             except Exception as exc:
-                logger.exception("S3 upload failed for request=%s", request_id)
+                logger.exception(
+                    "S3 upload failed for request=%s",
+                    request_id,
+                )
                 raise HTTPException(
                     status_code=502,
-                    detail=f"Video generated but S3 upload/presign failed: {exc}",
+                    detail=(
+                        "Video generated but S3 upload/presign failed: "
+                        f"{exc}"
+                    ),
                 ) from exc
 
             elapsed = time.monotonic() - started
@@ -619,5 +679,6 @@ async def generate_sync(envelope: GenerateEnvelope) -> dict[str, Any]:
         finally:
             if image_name:
                 (INPUT_DIR / image_name).unlink(missing_ok=True)
+
             if output_path and not KEEP_LOCAL_OUTPUTS:
                 output_path.unlink(missing_ok=True)
