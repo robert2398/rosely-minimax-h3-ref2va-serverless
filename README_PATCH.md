@@ -1,40 +1,42 @@
-# H3 namespaced S3 environment patch
+# 10Eros beta_5 deployment migration
 
-Replace these files in the repository:
+Replace the files in `rosely-minimax-h3-10eros-beta5-update.zip` at the same
+paths in the repository.
 
-- `provision.sh`
-- `model_server.py`
-- `.env.example`
-
-Then:
-
-```bash
-chmod +x provision.sh
-git add provision.sh model_server.py .env.example
-git commit -m "Namespace H3 S3 environment variables"
-git push origin main
-```
-
-## Vast template
-
-Remove the old generic variables:
+The migration changes the model artifact from the old ZIP pack:
 
 ```text
-S3_BUCKET
-S3_REGION
-S3_MODEL_KEY
-S3_CHECKSUM_KEY
-S3_OUTPUT_BUCKET
-S3_OUTPUT_PREFIX
-S3_PRESIGNED_URL_EXPIRES_SECONDS
-S3_DOWNLOAD_CONCURRENCY
-S3_DOWNLOAD_CHUNK_MIB
-S3_ENDPOINT_URL
+models/minimax-h3/rosely-h3-ref2va-quality-5090.zip
 ```
 
-Use the `VAST_TEMPLATE_ARGS.txt` values instead.
+to:
 
-Do NOT rename:
+```text
+models/minimax-h3/10eros-beta5-5090/10eros-beta5-5090-comfyui.tar.zst
+```
+
+and changes the runtime from:
+
+```text
+NVFP4 Ref2VA base + HMNSFW LoRA
+```
+
+to:
+
+```text
+10Eros-Max beta_5 non-Turbo INT8
+```
+
+The new provisioner:
+
+- downloads the single `.tar.zst` with concurrent S3 multipart transfer;
+- validates the archive SHA-256 from S3;
+- extracts into `/workspace`;
+- validates each extracted model with `model-files.sha256`;
+- removes the compressed archive to reclaim disk;
+- starts ComfyUI and the model server only after all checks pass.
+
+Keep standard AWS credential variable names unchanged:
 
 ```text
 AWS_ACCESS_KEY_ID
@@ -42,11 +44,4 @@ AWS_SECRET_ACCESS_KEY
 AWS_SESSION_TOKEN
 ```
 
-Those are standard boto3 credential variables.
-
-The new provisioner explicitly ignores a runtime `S3_BUCKET` even if Vast or
-`/workspace/.env` injects one. The first H3 provisioning lines should show:
-
-```text
-H3 S3: s3://rosely-infrastructure/models/minimax-h3/...
-```
+Use the Rosely namespaced H3 variables from `VAST_TEMPLATE_ARGS.txt`.

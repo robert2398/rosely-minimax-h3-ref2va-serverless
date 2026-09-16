@@ -41,24 +41,22 @@ MAX_INPUT_IMAGE_BYTES = int(
     os.getenv("MAX_INPUT_IMAGE_BYTES", str(30 * 1024 * 1024))
 )
 
-BASE_MODEL = "minimax_h3_ref2va_pruned_hybrid_ffn_nvfp4_blackwell.safetensors"
+BASE_MODEL = "10Eros_Max_h3_hybrid_beta5_int8.safetensors"
 TEXT_ENCODER = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
 VIDEO_VAE = "minimax_h3_video_vae_fp16.safetensors"
 AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
-MOTION_LORA = "HMNSFW-AIO-V2.5.safetensors"
 
 EXPECTED_MODELS = {
     "diffusion": Path("/workspace/ComfyUI/models/diffusion_models") / BASE_MODEL,
     "text_encoder": Path("/workspace/ComfyUI/models/text_encoders") / TEXT_ENCODER,
     "video_vae": Path("/workspace/ComfyUI/models/vae") / VIDEO_VAE,
     "audio_vae": Path("/workspace/ComfyUI/models/vae") / AUDIO_VAE,
-    "motion_lora": Path("/workspace/ComfyUI/models/loras") / MOTION_LORA,
 }
 
 VALID_SCHEDULERS = {"simple", "normal", "beta"}
 VALID_REF_IMAGE_SIZES = {"match", "max"}
 
-app = FastAPI(title="Rosely MiniMax H3 Ref2VA Serverless Model Server")
+app = FastAPI(title="Rosely 10Eros-Max beta_5 MiniMax H3 Ref2VA Server")
 generation_lock = asyncio.Lock()
 
 
@@ -75,7 +73,6 @@ def _load_base_workflow() -> dict[str, Any]:
     required_types = {
         "1": "CLIPLoader",
         "2": "UNETLoader",
-        "3": "LoraLoaderModelOnly",
         "4": "VAELoader",
         "5": "VAELoader",
         "6": "MiniMaxH3SigmaShift",
@@ -105,7 +102,6 @@ def _load_base_workflow() -> dict[str, Any]:
     expected_names = {
         ("1", "clip_name"): TEXT_ENCODER,
         ("2", "unet_name"): BASE_MODEL,
-        ("3", "lora_name"): MOTION_LORA,
         ("4", "vae_name"): VIDEO_VAE,
         ("5", "vae_name"): AUDIO_VAE,
     }
@@ -115,6 +111,9 @@ def _load_base_workflow() -> dict[str, Any]:
             raise RuntimeError(
                 f"Workflow {node_id}.{input_name}: expected {expected!r}, got {actual!r}"
             )
+
+    if workflow["6"]["inputs"].get("model") != ["2", 0]:
+        raise RuntimeError("Workflow must route 10Eros UNET directly into H3 sigma shift")
 
     if workflow["8"]["inputs"].get("ref_images.ref_image_0") != ["7", 0]:
         raise RuntimeError(
@@ -174,23 +173,19 @@ def _validate_length(data: dict[str, Any]) -> tuple[int, float]:
     if duration < 5.0 or duration > 15.0:
         raise HTTPException(
             status_code=422,
-            detail="duration_seconds must be between 5 and 15 for this production preset",
+            detail="duration_seconds must be between 5 and 15 for this preset",
         )
     length = _length_from_duration(duration)
     return length, length / 24.0
 
 
-def _prepare_prompt(data: dict[str, Any], lora_strength: float) -> str:
+def _prepare_prompt(data: dict[str, Any]) -> str:
     prompt = str(data.get("prompt") or "").strip()
     if not prompt:
         raise HTTPException(status_code=422, detail="prompt is required")
 
     if "<Picture 1>" not in prompt:
         prompt = f"<Picture 1> {prompt}"
-
-    auto_trigger = bool(data.get("auto_hmmotion_trigger", True))
-    if lora_strength > 0 and auto_trigger and "hmmotion" not in prompt.lower():
-        prompt = f"hmmotion {prompt}"
 
     return prompt
 
@@ -275,14 +270,15 @@ def _patch_workflow(
 
     length, actual_duration = _validate_length(data)
 
-    steps = int(data.get("steps", 20))
+    # 10Eros beta_5 non-Turbo quality preset.
+    steps = int(data.get("steps", 8))
     if steps < 4 or steps > 50:
         raise HTTPException(
             status_code=422,
             detail="steps must be between 4 and 50",
         )
 
-    scheduler = str(data.get("scheduler", "normal"))
+    scheduler = str(data.get("scheduler", "simple"))
     if scheduler not in VALID_SCHEDULERS:
         raise HTTPException(
             status_code=422,
@@ -296,13 +292,6 @@ def _patch_workflow(
             detail="ref_image_size must be 'match' or 'max'",
         )
 
-    lora_strength = float(data.get("lora_strength", 0.7))
-    if lora_strength < 0 or lora_strength > 1.2:
-        raise HTTPException(
-            status_code=422,
-            detail="lora_strength must be between 0 and 1.2",
-        )
-
     shift_video = float(data.get("shift_video", 12.0))
     shift_audio = float(data.get("shift_audio", 3.0))
 
@@ -311,9 +300,13 @@ def _patch_workflow(
         raise HTTPException(status_code=422, detail="seed must be >= 0")
 
     include_audio = bool(data.get("include_audio", True))
-    prompt = _prepare_prompt(data, lora_strength)
+    prompt = _prepare_prompt(data)
 
-    workflow["3"]["inputs"]["strength_model"] = lora_strength
+    # Backward compatibility: old callers may still send lora_strength and
+    # auto_hmmotion_trigger. 10Eros beta_5 is the base diffusion model now, so
+    # these fields are intentionally ignored.
+    legacy_lora_strength = data.get("lora_strength")
+
     workflow["6"]["inputs"]["shift_video"] = shift_video
     workflow["6"]["inputs"]["shift_audio"] = shift_audio
 
@@ -347,6 +340,7 @@ def _patch_workflow(
         workflow.pop("15", None)
 
     metadata = {
+        "model": BASE_MODEL,
         "seed": seed,
         "width": width,
         "height": height,
@@ -356,13 +350,15 @@ def _patch_workflow(
         "steps": steps,
         "scheduler": scheduler,
         "sampler": "res_multistep",
-        "lora_strength": lora_strength,
         "ref_image_size": ref_image_size,
         "include_audio": include_audio,
         "shift_video": shift_video,
         "shift_audio": shift_audio,
         "effective_prompt": prompt,
     }
+    if legacy_lora_strength is not None:
+        metadata["legacy_lora_strength_ignored"] = legacy_lora_strength
+
     return workflow, metadata
 
 
@@ -523,8 +519,6 @@ def _s3_output_config() -> tuple[str, str, int]:
 
 
 def _s3_client():
-    # boto3 still uses the standard AWS credential chain:
-    # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN.
     return boto3.client(
         "s3",
         endpoint_url=os.getenv("ROSELY_H3_S3_ENDPOINT_URL") or None,
@@ -593,6 +587,8 @@ async def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
+        "model": BASE_MODEL,
+        "profile": "10eros-beta5-non-turbo-int8-5090",
         "comfyui": True,
         "workflow": WORKFLOW_PATH.name,
         "s3_output_bucket": bucket,

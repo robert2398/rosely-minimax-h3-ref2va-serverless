@@ -2,14 +2,16 @@
   "artifact": {
     "bucket": "rosely-infrastructure",
     "region": "us-east-1",
-    "key": "models/minimax-h3/rosely-h3-ref2va-quality-5090.zip",
-    "checksum_key": "models/minimax-h3/rosely-h3-ref2va-quality-5090.zip.sha256",
-    "zip_root": "ComfyUI/"
+    "key": "models/minimax-h3/10eros-beta5-5090/10eros-beta5-5090-comfyui.tar.zst",
+    "checksum_key": "models/minimax-h3/10eros-beta5-5090/10eros-beta5-5090-comfyui.tar.zst.sha256",
+    "format": "tar.zst",
+    "archive_root": "ComfyUI/",
+    "contains_file_checksum_manifest": "model-files.sha256"
   },
   "generated_output": {
-    "bucket_env": "S3_OUTPUT_BUCKET",
+    "bucket_env": "ROSELY_H3_OUTPUT_BUCKET",
     "default_bucket": "rosely-infrastructure",
-    "prefix_env": "S3_OUTPUT_PREFIX",
+    "prefix_env": "ROSELY_H3_OUTPUT_PREFIX",
     "default_prefix": "generated/minimax-h3",
     "response": "S3 presigned GET URL"
   },
@@ -18,27 +20,34 @@
     "architecture": "Blackwell",
     "minimum_compute_capability_major_enforced_by_provisioner": 12
   },
+  "inference_profile": {
+    "model": "10Eros-Max beta_5 non-Turbo INT8",
+    "default_sampler": "res_multistep",
+    "default_scheduler": "simple",
+    "default_steps": 8,
+    "max_duration_seconds": 15,
+    "max_canvas_area": "1344x768"
+  },
   "files": [
     {
-      "path": "ComfyUI/models/diffusion_models/minimax_h3_ref2va_pruned_hybrid_ffn_nvfp4_blackwell.safetensors",
-      "purpose": "quality-first Ref2VA diffusion model"
+      "path": "ComfyUI/models/diffusion_models/10Eros_Max_h3_hybrid_beta5_int8.safetensors",
+      "purpose": "10Eros-Max beta_5 non-Turbo hybrid diffusion model",
+      "sha256": "488e0d51fad9fd6b277b6ebfbe46b3fd44374ff7baa1e3c9dfce58d3a1e5b33c"
     },
     {
       "path": "ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
-      "purpose": "H3 Qwen3-VL text/reference encoder"
+      "purpose": "H3 Qwen3-VL Blackwell NVFP4-AWQ text/reference encoder",
+      "sha256": "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6"
     },
     {
       "path": "ComfyUI/models/vae/minimax_h3_video_vae_fp16.safetensors",
-      "purpose": "video VAE"
+      "purpose": "H3 video VAE",
+      "sha256": "7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522"
     },
     {
       "path": "ComfyUI/models/vae/minimax_h3_audio_vae_fp32.safetensors",
-      "purpose": "audio VAE"
-    },
-    {
-      "path": "ComfyUI/models/loras/HMNSFW-AIO-V2.5.safetensors",
-      "purpose": "motion LoRA",
-      "trigger": "hmmotion"
+      "purpose": "H3 audio VAE",
+      "sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48"
     }
   ]
 }

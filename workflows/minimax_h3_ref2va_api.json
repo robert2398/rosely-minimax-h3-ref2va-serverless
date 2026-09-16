@@ -7,31 +7,17 @@
       "device": "default"
     },
     "_meta": {
-      "title": "Load H3 CLIP"
+      "title": "Load H3 Qwen3-VL NVFP4-AWQ"
     }
   },
   "2": {
     "class_type": "UNETLoader",
     "inputs": {
-      "unet_name": "minimax_h3_ref2va_pruned_hybrid_ffn_nvfp4_blackwell.safetensors",
+      "unet_name": "10Eros_Max_h3_hybrid_beta5_int8.safetensors",
       "weight_dtype": "default"
     },
     "_meta": {
-      "title": "Load H3 Ref2VA Blackwell Diffusion"
-    }
-  },
-  "3": {
-    "class_type": "LoraLoaderModelOnly",
-    "inputs": {
-      "model": [
-        "2",
-        0
-      ],
-      "lora_name": "HMNSFW-AIO-V2.5.safetensors",
-      "strength_model": 0.7
-    },
-    "_meta": {
-      "title": "HMNSFW AIO V2.5"
+      "title": "Load 10Eros-Max beta_5 Non-Turbo INT8"
     }
   },
   "4": {
@@ -56,7 +42,7 @@
     "class_type": "MiniMaxH3SigmaShift",
     "inputs": {
       "model": [
-        "3",
+        "2",
         0
       ],
       "shift_video": 12.0,
@@ -90,7 +76,7 @@
         "5",
         0
       ],
-      "prompt": "<Picture 1> hmmotion subtle natural movement, stable identity, coherent motion.",
+      "prompt": "<Picture 1> subtle natural movement, stable identity, coherent anatomy and motion.",
       "width": 480,
       "height": 864,
       "length": 124,
@@ -101,7 +87,7 @@
       ]
     },
     "_meta": {
-      "title": "H3 Ref2VA Conditioning"
+      "title": "10Eros/H3 Ref2VA Conditioning"
     }
   },
   "9": {
@@ -136,12 +122,12 @@
         "6",
         0
       ],
-      "scheduler": "normal",
-      "steps": 20,
+      "scheduler": "simple",
+      "steps": 8,
       "denoise": 1.0
     },
     "_meta": {
-      "title": "H3 Scheduler"
+      "title": "10Eros Quality Scheduler"
     }
   },
   "12": {

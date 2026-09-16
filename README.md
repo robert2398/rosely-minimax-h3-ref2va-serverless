@@ -1,38 +1,56 @@
-# Rosely MiniMax H3 Ref2VA — Vast Serverless
+# Rosely 10Eros-Max beta_5 / MiniMax H3 Ref2VA — Vast Serverless
 
-Quality-first MiniMax H3 Ref2VA deployment for RTX 5090 / Blackwell.
+Quality-first Vast Serverless deployment for **RTX 5090 / Blackwell** using the
+**10Eros-Max beta_5 non-Turbo INT8** MiniMax H3 hybrid.
 
 ## Runtime
-
-The worker runs:
 
 - ComfyUI: `127.0.0.1:18189`
 - H3 FastAPI model server: `127.0.0.1:18288`
 - Serverless route: `POST /generate/sync`
+- Input: reference image + prompt
+- Output: private S3 object + presigned GET URL
 
-The API accepts a reference image + prompt and returns a **private S3 presigned URL** for the generated video.
+## Model pack
 
-## Models
+The single S3 deployment artifact is:
+
+```text
+s3://rosely-infrastructure/models/minimax-h3/10eros-beta5-5090/
+├── 10eros-beta5-5090-comfyui.tar.zst
+└── 10eros-beta5-5090-comfyui.tar.zst.sha256
+```
+
+The archive contains:
 
 ```text
 ComfyUI/models/
 ├── diffusion_models/
-│   └── minimax_h3_ref2va_pruned_hybrid_ffn_nvfp4_blackwell.safetensors
+│   └── 10Eros_Max_h3_hybrid_beta5_int8.safetensors
 ├── text_encoders/
 │   └── qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
-├── vae/
-│   ├── minimax_h3_video_vae_fp16.safetensors
-│   └── minimax_h3_audio_vae_fp32.safetensors
-└── loras/
-    └── HMNSFW-AIO-V2.5.safetensors
+└── vae/
+    ├── minimax_h3_video_vae_fp16.safetensors
+    └── minimax_h3_audio_vae_fp32.safetensors
+
+model-files.sha256
 ```
 
-The S3 model artifact is expected at:
+The provisioner performs two integrity layers:
 
-```text
-s3://rosely-infrastructure/models/minimax-h3/rosely-h3-ref2va-quality-5090.zip
-s3://rosely-infrastructure/models/minimax-h3/rosely-h3-ref2va-quality-5090.zip.sha256
-```
+1. verifies the downloaded `.tar.zst` against the S3 `.sha256`;
+2. after extraction, runs `sha256sum -c /workspace/model-files.sha256`.
+
+The compressed archive is deleted after successful extraction and verification.
+
+## Why there is no HMNSFW LoRA
+
+The previous repo version used a separate H3 model plus `HMNSFW-AIO-V2.5`.
+This version uses **10Eros beta_5 as the diffusion model itself**, so the old
+LoRA node and `hmmotion` auto-trigger were removed.
+
+For backward compatibility, an old caller may still include `lora_strength`;
+the API ignores it and returns `legacy_lora_strength_ignored` in metadata.
 
 ## Vast environment variables
 
@@ -45,31 +63,62 @@ PROVISIONING_SCRIPT=https://raw.githubusercontent.com/robert2398/rosely-minimax-
 
 AWS_ACCESS_KEY_ID=<Vast secret>
 AWS_SECRET_ACCESS_KEY=<Vast secret>
+# AWS_SESSION_TOKEN=<only for temporary credentials>
 
-S3_BUCKET=rosely-infrastructure
-S3_REGION=us-east-1
-S3_MODEL_KEY=models/minimax-h3/rosely-h3-ref2va-quality-5090.zip
-S3_CHECKSUM_KEY=models/minimax-h3/rosely-h3-ref2va-quality-5090.zip.sha256
+ROSELY_H3_S3_BUCKET=rosely-infrastructure
+ROSELY_H3_S3_REGION=us-east-1
+ROSELY_H3_S3_MODEL_KEY=models/minimax-h3/10eros-beta5-5090/10eros-beta5-5090-comfyui.tar.zst
+ROSELY_H3_S3_CHECKSUM_KEY=models/minimax-h3/10eros-beta5-5090/10eros-beta5-5090-comfyui.tar.zst.sha256
 
-S3_OUTPUT_BUCKET=rosely-infrastructure
-S3_OUTPUT_PREFIX=generated/minimax-h3
-S3_PRESIGNED_URL_EXPIRES_SECONDS=3600
+ROSELY_H3_OUTPUT_BUCKET=rosely-infrastructure
+ROSELY_H3_OUTPUT_PREFIX=generated/minimax-h3
+ROSELY_H3_PRESIGNED_URL_EXPIRES_SECONDS=3600
 
-MIN_FREE_DISK_GB=85
+ROSELY_H3_S3_DOWNLOAD_CONCURRENCY=16
+ROSELY_H3_S3_DOWNLOAD_CHUNK_MIB=64
+
+MIN_FREE_DISK_GB=90
 GENERATION_TIMEOUT_SECONDS=3600
+KEEP_LOCAL_OUTPUTS=false
 COMFYUI_ARGS=
 ```
 
-Keep the AWS values in Vast secrets. Do not commit them.
+Keep AWS credentials in Vast secrets. Do not commit them.
 
 ## Recommended worker
 
 - RTX 5090 32 GB
-- 64 GB+ RAM
+- Blackwell-capable PyTorch/CUDA image
+- 64 GB RAM minimum; 96 GB+ preferred
 - 120 GB+ disk
-- Recent PyTorch/CUDA image with Blackwell/NVFP4 support
 
-The provisioner rejects non-Blackwell GPUs.
+The provisioner intentionally rejects non-Blackwell GPUs because the bundled
+Qwen3-VL encoder is NVFP4-AWQ.
+
+## Generation preset
+
+Default server values:
+
+```text
+sampler    = res_multistep
+scheduler  = simple
+steps      = 8
+fps        = 24
+audio      = enabled
+```
+
+The model author recommends 6–8 step `simple`-scheduler setups for beta_5 and
+warns against reference-degrading cache/spectrum optimizations. This repo keeps
+those optimizations off.
+
+H3 frame lengths use the `17k+5` grid:
+
+- ~5 s → 124 frames
+- ~10 s → 243 frames
+- ~15 s → 362 frames
+
+Width and height must be divisible by 32. Canvas area is capped at `1344x768`
+(or an equivalent portrait area such as `768x1344`).
 
 ## API request
 
@@ -78,79 +127,39 @@ The provisioner rejects non-Blackwell GPUs.
   "input": {
     "request_id": "video_123",
     "input_image_url": "https://example.com/reference.png",
-    "prompt": "Natural coherent motion while preserving identity and pose consistency.",
+    "prompt": "Natural coherent movement while preserving identity, anatomy, lighting and camera consistency.",
     "width": 480,
     "height": 864,
     "duration_seconds": 5,
-    "steps": 20,
-    "scheduler": "normal",
+    "steps": 8,
+    "scheduler": "simple",
     "ref_image_size": "match",
-    "lora_strength": 0.7,
     "include_audio": true
   }
 }
 ```
 
-The server automatically adds `<Picture 1>` when missing. With a non-zero motion-LoRA strength it also adds `hmmotion` unless `auto_hmmotion_trigger=false`.
+The server automatically prefixes `<Picture 1>` when it is missing.
 
-H3 length is snapped to the model's `17k+5` frame grid at 24 fps:
-
-- ~5 s → 124 frames
-- ~10 s → 243 frames
-- ~15 s → 362 frames
-
-Width and height must be multiples of 32. The server caps the generation canvas to the 1344×768 pixel area.
-
-## Successful response
-
-Vast wraps the worker response. `result["response"]` contains data similar to:
-
-```json
-{
-  "request_id": "video_123",
-  "status": "completed",
-  "output_url": "https://rosely-infrastructure.s3.amazonaws.com/...",
-  "output_url_expires_in_seconds": 3600,
-  "s3_uri": "s3://rosely-infrastructure/generated/minimax-h3/video_123.mp4",
-  "size_bytes": 12345678,
-  "generation_seconds": 184.2,
-  "seed": 123456789,
-  "width": 480,
-  "height": 864,
-  "length": 124,
-  "fps": 24
-}
-```
-
-The S3 bucket remains private. `output_url` is a temporary signed GET URL.
-
-## Deployment checks
-
-Inside a worker:
+## Health / diagnostics
 
 ```bash
 supervisorctl status h3-comfyui h3-model-server
 curl -s http://127.0.0.1:18189/system_stats | jq .
 curl -s http://127.0.0.1:18288/health | jq .
 nvidia-smi
+df -h /workspace
 ```
 
 Logs:
 
 ```bash
+tail -f /var/log/portal/h3-provision.log
 tail -f /var/log/portal/comfyui.log
 tail -f /var/log/portal/model-server.log
 ```
 
 ## Test after deployment
-
-Notebook:
-
-```text
-notebooks/test_vast_h3_serverless.ipynb
-```
-
-Terminal client:
 
 ```bash
 pip install "vastai[serverless]"
@@ -160,16 +169,32 @@ export INPUT_IMAGE_URL='https://.../reference.png'
 python test_vast_endpoint.py
 ```
 
-## Workflow basis
+## Workflow
 
-`workflows/minimax_h3_ref2va_api.json` is a ComfyUI API-format graph using:
+`workflows/minimax_h3_ref2va_api.json` uses:
 
-`CLIPLoader → UNETLoader → HMNSFW LoRA → MiniMaxH3SigmaShift → MiniMaxH3ReferenceToVideo → BasicGuider → res_multistep → joint video/audio decode → SaveVideo`
+```text
+CLIPLoader
+→ 10Eros UNETLoader
+→ MiniMaxH3SigmaShift
+→ MiniMaxH3ReferenceToVideo
+→ BasicGuider
+→ res_multistep / simple
+→ video + audio decode
+→ SaveVideo
+```
 
-It uses the flat autogrow API input key:
+The reference image uses the flat autogrow API key:
 
 ```text
 ref_images.ref_image_0
 ```
 
-for the reference image.
+## S3 permissions required by the worker
+
+The Vast worker needs read access to the model bundle/checksum and write/read
+access to the generated-output prefix. A minimal policy should cover:
+
+- `s3:GetObject` for the model bundle and checksum;
+- `s3:PutObject` for `generated/minimax-h3/*`;
+- `s3:GetObject` for generated files when using presigned GET URLs.

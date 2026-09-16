@@ -17,33 +17,29 @@ COMFY_COMMIT=${COMFY_COMMIT:-345c9190497c82cff53e71fb4ae00d1e135a6542}
 PYWORKER_REPO=${PYWORKER_REPO:?PYWORKER_REPO must point to the H3 serverless repository}
 PYWORKER_REF=${PYWORKER_REF:-main}
 
-# ---------------------------------------------------------------------------
-# Namespaced H3 storage variables.
-#
-# IMPORTANT:
-# We intentionally DO NOT read generic S3_BUCKET / S3_REGION / S3_MODEL_KEY
-# variables. Vast's runtime may provide or source generic S3 variables from
-# /etc/environment or /workspace/.env. Using a Rosely-specific namespace
-# prevents those values from overriding this deployment.
-# ---------------------------------------------------------------------------
+# Rosely-namespaced S3 settings. Generic S3_* variables are intentionally not
+# consumed because Vast/base images may populate them for unrelated services.
 H3_S3_BUCKET=${ROSELY_H3_S3_BUCKET:?ROSELY_H3_S3_BUCKET is required}
-H3_S3_MODEL_KEY=${ROSELY_H3_S3_MODEL_KEY:-models/minimax-h3/rosely-h3-ref2va-quality-5090.zip}
-H3_S3_CHECKSUM_KEY=${ROSELY_H3_S3_CHECKSUM_KEY:-models/minimax-h3/rosely-h3-ref2va-quality-5090.zip.sha256}
+H3_S3_MODEL_KEY=${ROSELY_H3_S3_MODEL_KEY:-models/minimax-h3/10eros-beta5-5090/10eros-beta5-5090-comfyui.tar.zst}
+H3_S3_CHECKSUM_KEY=${ROSELY_H3_S3_CHECKSUM_KEY:-models/minimax-h3/10eros-beta5-5090/10eros-beta5-5090-comfyui.tar.zst.sha256}
 H3_S3_REGION=${ROSELY_H3_S3_REGION:-us-east-1}
 H3_S3_ENDPOINT_URL=${ROSELY_H3_S3_ENDPOINT_URL:-}
 
 H3_S3_DOWNLOAD_CONCURRENCY=${ROSELY_H3_S3_DOWNLOAD_CONCURRENCY:-16}
 H3_S3_DOWNLOAD_CHUNK_MIB=${ROSELY_H3_S3_DOWNLOAD_CHUNK_MIB:-64}
 
-MIN_FREE_DISK_GB=${MIN_FREE_DISK_GB:-85}
+# Peak disk usage is archive (~36 GiB) + extracted models (~43 GiB) + ComfyUI
+# and output headroom. A 120 GiB+ Vast disk is recommended.
+MIN_FREE_DISK_GB=${MIN_FREE_DISK_GB:-90}
 
-MODEL_ZIP=/workspace/rosely-h3-ref2va-quality-5090.zip
-CHECKSUM_FILE=/workspace/rosely-h3-ref2va-quality-5090.zip.sha256
+MODEL_ARCHIVE=/workspace/10eros-beta5-5090-comfyui.tar.zst
+CHECKSUM_FILE=/workspace/10eros-beta5-5090-comfyui.tar.zst.sha256
+MODEL_MANIFEST=/workspace/model-files.sha256
 
 export APP_DIR COMFY_DIR
 export H3_S3_BUCKET H3_S3_MODEL_KEY H3_S3_CHECKSUM_KEY H3_S3_REGION
 export H3_S3_ENDPOINT_URL H3_S3_DOWNLOAD_CONCURRENCY H3_S3_DOWNLOAD_CHUNK_MIB
-export MODEL_ZIP CHECKSUM_FILE
+export MODEL_ARCHIVE CHECKSUM_FILE MODEL_MANIFEST
 
 log() {
   printf '\n[%s] %s\n' "$(date -Iseconds)" "$*"
@@ -62,13 +58,13 @@ on_error() {
 }
 trap 'on_error $LINENO' ERR
 
-log "Rosely MiniMax H3 provisioning STARTED"
+log "Rosely MiniMax H3 / 10Eros beta_5 provisioning STARTED"
 log "Repo: ${PYWORKER_REPO} @ ${PYWORKER_REF}"
 log "H3 S3: s3://${H3_S3_BUCKET}/${H3_S3_MODEL_KEY}"
 log "Region: ${H3_S3_REGION}"
 
 if [[ -n "${S3_BUCKET:-}" ]]; then
-  log "NOTICE: legacy S3_BUCKET is present in the runtime environment and is intentionally ignored."
+  log "NOTICE: legacy S3_BUCKET is present and intentionally ignored."
 fi
 
 ensure_system_packages() {
@@ -78,7 +74,7 @@ ensure_system_packages() {
   command -v ffmpeg >/dev/null 2>&1 || packages+=(ffmpeg)
   command -v git >/dev/null 2>&1 || packages+=(git)
   command -v jq >/dev/null 2>&1 || packages+=(jq)
-  command -v unzip >/dev/null 2>&1 || packages+=(unzip)
+  command -v zstd >/dev/null 2>&1 || packages+=(zstd)
   command -v supervisorctl >/dev/null 2>&1 || packages+=(supervisor)
 
   dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null \
@@ -115,7 +111,7 @@ check_disk_space() {
   log "Available /workspace disk: $((available_kb / 1024 / 1024)) GiB"
 
   if (( available_kb < required_kb )); then
-    fail "At least ${MIN_FREE_DISK_GB} GiB free is required. Use a 120 GiB+ Vast disk."
+    fail "At least ${MIN_FREE_DISK_GB} GiB free is required before model download. Use a 120 GiB+ Vast disk."
   fi
 }
 
@@ -163,6 +159,22 @@ install_comfyui_preserving_models() {
   fi
 }
 
+cleanup_stale_h3_models() {
+  # Remove only files from the previous Rosely H3 pack. Do not wipe generic
+  # ComfyUI model directories because a Vast image may contain unrelated assets.
+  local stale=(
+    "$COMFY_DIR/models/diffusion_models/minimax_h3_ref2va_pruned_hybrid_ffn_nvfp4_blackwell.safetensors"
+    "$COMFY_DIR/models/loras/HMNSFW-AIO-V2.5.safetensors"
+  )
+
+  for path in "${stale[@]}"; do
+    if [[ -f "$path" ]]; then
+      log "Removing stale model from previous pack: $path"
+      rm -f "$path"
+    fi
+  done
+}
+
 ensure_system_packages
 check_disk_space
 
@@ -200,6 +212,7 @@ cap = torch.cuda.get_device_capability(0)
 print("GPU:", name)
 print("Compute capability:", cap)
 
+# The Qwen3-VL encoder in this pack is NVFP4-AWQ, so keep the Blackwell guard.
 if cap[0] < 12:
     raise SystemExit(
         f"Blackwell GPU required for this artifact. "
@@ -219,15 +232,15 @@ mkdir -p \
   "$COMFY_DIR/models/diffusion_models" \
   "$COMFY_DIR/models/text_encoders" \
   "$COMFY_DIR/models/vae" \
-  "$COMFY_DIR/models/loras" \
   "$COMFY_DIR/input" \
   "$COMFY_DIR/output" \
   "$COMFY_DIR/temp" \
   /var/log/portal
 
+cleanup_stale_h3_models
 check_disk_space
 
-log "STEP: Downloading checksum-verified H3 model ZIP from S3 (live progress every ~5s)"
+log "STEP: Downloading checksum-verified 10Eros beta_5 TAR.ZST from S3"
 
 python -u - <<'PY'
 from __future__ import annotations
@@ -250,13 +263,9 @@ model_key = os.environ["H3_S3_MODEL_KEY"]
 checksum_key = os.environ["H3_S3_CHECKSUM_KEY"]
 region = os.environ.get("H3_S3_REGION", "us-east-1")
 endpoint_url = os.environ.get("H3_S3_ENDPOINT_URL") or None
-concurrency = max(
-    1, int(os.environ.get("H3_S3_DOWNLOAD_CONCURRENCY", "16"))
-)
-chunk_mib = max(
-    16, int(os.environ.get("H3_S3_DOWNLOAD_CHUNK_MIB", "64"))
-)
-model_zip = Path(os.environ["MODEL_ZIP"])
+concurrency = max(1, int(os.environ.get("H3_S3_DOWNLOAD_CONCURRENCY", "16")))
+chunk_mib = max(16, int(os.environ.get("H3_S3_DOWNLOAD_CHUNK_MIB", "64")))
+archive = Path(os.environ["MODEL_ARCHIVE"])
 checksum_file = Path(os.environ["CHECKSUM_FILE"])
 
 client = boto3.client(
@@ -283,6 +292,8 @@ checksum_obj = client.get_object(Bucket=bucket, Key=checksum_key)
 checksum_text = checksum_obj["Body"].read().decode("utf-8").strip()
 checksum_file.write_text(checksum_text + "\n", encoding="utf-8")
 expected = checksum_text.split()[0].lower()
+if len(expected) != 64:
+    raise SystemExit(f"Invalid SHA-256 checksum file: {checksum_text!r}")
 print(f"[S3] Expected SHA-256: {expected}", flush=True)
 
 transfer = TransferConfig(
@@ -292,7 +303,7 @@ transfer = TransferConfig(
     use_threads=True,
 )
 
-tmp = model_zip.with_suffix(model_zip.suffix + ".part")
+tmp = archive.with_suffix(archive.suffix + ".part")
 tmp.unlink(missing_ok=True)
 
 
@@ -335,7 +346,7 @@ client.download_file(
     Callback=Progress(size),
 )
 
-print("[SHA256] Verifying downloaded ZIP...", flush=True)
+print("[SHA256] Verifying downloaded TAR.ZST...", flush=True)
 digest = hashlib.sha256()
 verified = 0
 verify_started = time.monotonic()
@@ -358,59 +369,63 @@ with tmp.open("rb") as handle:
             last_verify = now
 
 actual = digest.hexdigest()
-
 if actual != expected:
     tmp.unlink(missing_ok=True)
     raise SystemExit(
-        f"ZIP SHA mismatch: expected {expected}, got {actual}"
+        f"TAR.ZST SHA mismatch: expected {expected}, got {actual}"
     )
 
-tmp.replace(model_zip)
+tmp.replace(archive)
 print(
-    f"Verified artifact: {model_zip} "
-    f"({model_zip.stat().st_size / GIB:.2f} GiB)",
+    f"Verified artifact: {archive} "
+    f"({archive.stat().st_size / GIB:.2f} GiB)",
     flush=True,
 )
 PY
 
-log "STEP: Extracting H3 model artifact into /workspace"
-ls -lh "$MODEL_ZIP"
+log "STEP: Extracting 10Eros model artifact into /workspace"
+ls -lh "$MODEL_ARCHIVE"
 df -h /workspace
-unzip -o "$MODEL_ZIP" -d /workspace
+tar --zstd -xf "$MODEL_ARCHIVE" -C /workspace
 
 log "Extraction finished"
 du -sh "$COMFY_DIR/models" || true
 df -h /workspace
 
-log "Deleting ZIP after extraction"
-rm -f "$MODEL_ZIP" "$CHECKSUM_FILE"
+[[ -f "$MODEL_MANIFEST" ]] \
+  || fail "Archive did not contain /workspace/model-files.sha256"
 
-log "Validating exact H3 model pack"
+log "STEP: Verifying every extracted model against model-files.sha256"
+(
+  cd /workspace
+  sha256sum -c "$(basename "$MODEL_MANIFEST")"
+)
+
+log "Deleting compressed archive after successful extraction/verification"
+rm -f "$MODEL_ARCHIVE" "$CHECKSUM_FILE"
+
+log "Validating exact 10Eros beta_5 model pack"
 python -u - <<'PY'
 from pathlib import Path
 
 base = Path("/workspace/ComfyUI/models")
 
 files = {
-    "quality-first Ref2VA diffusion": (
-        base / "diffusion_models/minimax_h3_ref2va_pruned_hybrid_ffn_nvfp4_blackwell.safetensors",
-        16_000_000_000,
+    "10Eros-Max beta_5 non-Turbo INT8 diffusion": (
+        base / "diffusion_models/10Eros_Max_h3_hybrid_beta5_int8.safetensors",
+        20_000_000_000,
     ),
-    "Qwen3-VL H3 text encoder": (
+    "Qwen3-VL H3 NVFP4-AWQ text encoder": (
         base / "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
         15_000_000_000,
     ),
-    "H3 video VAE": (
+    "H3 video VAE FP16": (
         base / "vae/minimax_h3_video_vae_fp16.safetensors",
         5_000_000_000,
     ),
-    "H3 audio VAE": (
+    "H3 audio VAE FP32": (
         base / "vae/minimax_h3_audio_vae_fp32.safetensors",
         500_000_000,
-    ),
-    "HMNSFW AIO V2.5": (
-        base / "loras/HMNSFW-AIO-V2.5.safetensors",
-        80_000_000,
     ),
 }
 
@@ -422,8 +437,10 @@ for label, (path, minimum) in files.items():
         raise SystemExit(f"{label} unexpectedly small: {size:,} bytes")
     print(f"OK  {label}: {size / (1024**3):.2f} GiB")
 
-print("All five H3 files are present.")
+print("All four 10Eros/H3 files are present.")
 PY
+
+rm -f "$MODEL_MANIFEST"
 
 log "Disabling generic ComfyUI services that can conflict with this stack"
 for service in api-wrapper comfyui; do

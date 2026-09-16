@@ -21,7 +21,7 @@ def _workload(payload: dict[str, Any]) -> float:
         frames = float(data["length"])
     else:
         frames = max(5.0, float(data.get("duration_seconds", 5.0)) * 24.0)
-    steps = float(data.get("steps", 20))
+    steps = float(data.get("steps", 8))
     return max(1.0, width * height * frames * steps / 100_000_000.0)
 
 
@@ -50,9 +50,8 @@ benchmark_dataset = [
             "height": 256,
             "length": 5,
             "steps": 4,
-            "scheduler": "normal",
+            "scheduler": "simple",
             "ref_image_size": "match",
-            "lora_strength": 0.7,
             "include_audio": False,
             "seed": 12345,
         }

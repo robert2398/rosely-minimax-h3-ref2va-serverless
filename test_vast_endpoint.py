@@ -44,9 +44,8 @@ async def main() -> None:
             "width": int(os.getenv("H3_WIDTH", "480")),
             "height": int(os.getenv("H3_HEIGHT", "864")),
             "duration_seconds": float(os.getenv("H3_DURATION", "5")),
-            "steps": int(os.getenv("H3_STEPS", "20")),
-            "scheduler": os.getenv("H3_SCHEDULER", "normal"),
-            "lora_strength": float(os.getenv("H3_LORA_STRENGTH", "0.7")),
+            "steps": int(os.getenv("H3_STEPS", "8")),
+            "scheduler": os.getenv("H3_SCHEDULER", "simple"),
             "ref_image_size": os.getenv("H3_REF_IMAGE_SIZE", "match"),
             "include_audio": os.getenv("H3_INCLUDE_AUDIO", "true").lower() == "true",
         }
