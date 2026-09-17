@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 from io import BytesIO
 from typing import Any
 
@@ -9,8 +10,27 @@ from vastai import BenchmarkConfig, HandlerConfig, LogActionConfig, Worker, Work
 
 MODEL_SERVER_URL = "http://127.0.0.1"
 MODEL_SERVER_PORT = 18288
-MODEL_LOG_FILE = "/var/log/portal/model-server.log"
+MODEL_LOG_FILE = "/var/log/portal/comfyui.log"
 MODEL_HEALTHCHECK_ENDPOINT = "/health"
+
+MODEL_LOAD_LOG_MSGS = [
+    "To see the GUI go to:",
+]
+
+MODEL_ERROR_LOG_MSGS = [
+    "torch.OutOfMemoryError",
+    "CUDA out of memory",
+    "CUDA error: an illegal memory access was encountered",
+    "ERROR UNSUPPORTED UNET",
+    "MetadataIncompleteBuffer",
+    "Value not in list:",
+]
+
+MODEL_INFO_LOG_MSGS = [
+    "Requested to load",
+    "loaded completely",
+    "loaded partially",
+]
 
 
 def _workload(payload: dict[str, Any]) -> float:
@@ -37,10 +57,17 @@ def _benchmark_image() -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+_benchmark_worker_id = (
+    os.getenv("CONTAINER_ID")
+    or os.getenv("INSTANCE_ID")
+    or os.getenv("HOSTNAME")
+    or "worker"
+)
+
 benchmark_dataset = [
     {
         "input": {
-            "request_id": "vast-benchmark-minimax-h3",
+            "request_id": f"vast-benchmark-minimax-h3-{_benchmark_worker_id}",
             "input_image_base64": _benchmark_image(),
             "prompt": (
                 "Preserve <Picture 1>. Tiny natural head movement, stable camera, "
@@ -78,15 +105,9 @@ worker_config = WorkerConfig(
         )
     ],
     log_action_config=LogActionConfig(
-        on_load=["To see the GUI go to:", "Prompt executed"],
-        on_error=[
-            "torch.OutOfMemoryError",
-            "CUDA out of memory",
-            "CUDA error: an illegal memory access was encountered",
-            "ERROR UNSUPPORTED UNET",
-            "[ERROR] Provisioning Script failed",
-        ],
-        on_info=["Requested to load", "loaded completely", "loaded partially"],
+        on_load=MODEL_LOAD_LOG_MSGS,
+        on_error=MODEL_ERROR_LOG_MSGS,
+        on_info=MODEL_INFO_LOG_MSGS,
     ),
 )
 
