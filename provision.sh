@@ -28,18 +28,21 @@ H3_S3_ENDPOINT_URL=${ROSELY_H3_S3_ENDPOINT_URL:-}
 H3_S3_DOWNLOAD_CONCURRENCY=${ROSELY_H3_S3_DOWNLOAD_CONCURRENCY:-16}
 H3_S3_DOWNLOAD_CHUNK_MIB=${ROSELY_H3_S3_DOWNLOAD_CHUNK_MIB:-64}
 
-# Peak disk usage is archive (~36 GiB) + extracted models (~43 GiB) + ComfyUI
-# and output headroom. A 120 GiB+ Vast disk is recommended.
-MIN_FREE_DISK_GB=${MIN_FREE_DISK_GB:-90}
+# Fresh provisioning peaks at roughly 36 GiB compressed + 40 GiB extracted
+# plus ComfyUI/runtime overhead. 120 GiB works, but 150 GiB is recommended
+# for retry/debug headroom. Disk checks are state-aware so retries are idempotent.
+MIN_FREE_DISK_GB=${MIN_FREE_DISK_GB:-85}
+MIN_EXTRACT_FREE_GB=${MIN_EXTRACT_FREE_GB:-45}
 
 MODEL_ARCHIVE=/workspace/10eros-beta5-5090-comfyui.tar.zst
 CHECKSUM_FILE=/workspace/10eros-beta5-5090-comfyui.tar.zst.sha256
 MODEL_MANIFEST=/workspace/model-files.sha256
+MODEL_READY_MARKER=/workspace/.rosely-h3-10eros-beta5.ready
 
 export APP_DIR COMFY_DIR
 export H3_S3_BUCKET H3_S3_MODEL_KEY H3_S3_CHECKSUM_KEY H3_S3_REGION
 export H3_S3_ENDPOINT_URL H3_S3_DOWNLOAD_CONCURRENCY H3_S3_DOWNLOAD_CHUNK_MIB
-export MODEL_ARCHIVE CHECKSUM_FILE MODEL_MANIFEST
+export MODEL_ARCHIVE CHECKSUM_FILE MODEL_MANIFEST MODEL_READY_MARKER
 
 log() {
   printf '\n[%s] %s\n' "$(date -Iseconds)" "$*"
@@ -103,16 +106,90 @@ ensure_system_packages() {
 }
 
 check_disk_space() {
+  local required_gb=${1:?required GiB missing}
+  local purpose=${2:-operation}
   local available_kb required_kb
+
   mkdir -p /workspace
   available_kb=$(df -Pk /workspace | awk 'NR==2 {print $4}')
-  required_kb=$((MIN_FREE_DISK_GB * 1024 * 1024))
+  required_kb=$((required_gb * 1024 * 1024))
 
-  log "Available /workspace disk: $((available_kb / 1024 / 1024)) GiB"
+  log "Available /workspace disk: $((available_kb / 1024 / 1024)) GiB (${purpose})"
 
   if (( available_kb < required_kb )); then
-    fail "At least ${MIN_FREE_DISK_GB} GiB free is required before model download. Use a 120 GiB+ Vast disk."
+    fail "At least ${required_gb} GiB free is required for ${purpose}. Increase the Vast disk (150 GiB recommended)."
   fi
+}
+
+model_pack_files_present() {
+  [[ -f "$COMFY_DIR/models/diffusion_models/10Eros_Max_h3_hybrid_beta5_int8.safetensors" ]] &&
+  [[ -f "$COMFY_DIR/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors" ]] &&
+  [[ -f "$COMFY_DIR/models/vae/minimax_h3_video_vae_fp16.safetensors" ]] &&
+  [[ -f "$COMFY_DIR/models/vae/minimax_h3_audio_vae_fp32.safetensors" ]]
+}
+
+model_pack_sizes_sane() {
+  model_pack_files_present || return 1
+
+  [[ $(stat -c %s "$COMFY_DIR/models/diffusion_models/10Eros_Max_h3_hybrid_beta5_int8.safetensors") -ge 20000000000 ]] &&
+  [[ $(stat -c %s "$COMFY_DIR/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors") -ge 15000000000 ]] &&
+  [[ $(stat -c %s "$COMFY_DIR/models/vae/minimax_h3_video_vae_fp16.safetensors") -ge 5000000000 ]] &&
+  [[ $(stat -c %s "$COMFY_DIR/models/vae/minimax_h3_audio_vae_fp32.safetensors") -ge 500000000 ]]
+}
+
+verify_expected_model_hashes() {
+  local checksum_tmp
+  checksum_tmp=$(mktemp /workspace/.10eros-model-hashes.XXXXXX)
+  cat > "$checksum_tmp" <<'EOF'
+488e0d51fad9fd6b277b6ebfbe46b3fd44374ff7baa1e3c9dfce58d3a1e5b33c  ComfyUI/models/diffusion_models/10Eros_Max_h3_hybrid_beta5_int8.safetensors
+35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6  ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522  ComfyUI/models/vae/minimax_h3_video_vae_fp16.safetensors
+8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48  ComfyUI/models/vae/minimax_h3_audio_vae_fp32.safetensors
+EOF
+
+  if (cd /workspace && sha256sum -c "$checksum_tmp"); then
+    rm -f "$checksum_tmp"
+    return 0
+  fi
+
+  rm -f "$checksum_tmp"
+  return 1
+}
+
+mark_model_pack_ready() {
+  cat > "$MODEL_READY_MARKER" <<EOF
+profile=10eros-beta5-non-turbo-int8-5090
+archive_sha256=dbecf6da69978835ef2be92efe1104a8c4ee904abe7ac35b8108bcba3835c006
+verified_at=$(date -Iseconds)
+EOF
+}
+
+model_pack_ready() {
+  if [[ -f "$MODEL_READY_MARKER" ]] && model_pack_sizes_sane; then
+    log "Validated model-ready marker found; reusing extracted 10Eros model pack"
+    return 0
+  fi
+
+  if model_pack_sizes_sane; then
+    log "Existing 10Eros model files found without a ready marker; verifying SHA-256 once"
+    if verify_expected_model_hashes; then
+      mark_model_pack_ready
+      return 0
+    fi
+    log "Existing model files are incomplete/corrupt; they will be replaced"
+  fi
+
+  return 1
+}
+
+cleanup_partial_current_pack() {
+  rm -f \
+    "$COMFY_DIR/models/diffusion_models/10Eros_Max_h3_hybrid_beta5_int8.safetensors" \
+    "$COMFY_DIR/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors" \
+    "$COMFY_DIR/models/vae/minimax_h3_video_vae_fp16.safetensors" \
+    "$COMFY_DIR/models/vae/minimax_h3_audio_vae_fp32.safetensors" \
+    "$MODEL_MANIFEST" \
+    "$MODEL_READY_MARKER"
 }
 
 clone_exact_commit() {
@@ -176,7 +253,6 @@ cleanup_stale_h3_models() {
 }
 
 ensure_system_packages
-check_disk_space
 
 log "Cloning H3 serverless repository"
 rm -rf "$APP_DIR"
@@ -238,9 +314,26 @@ mkdir -p \
   /var/log/portal
 
 cleanup_stale_h3_models
-check_disk_space
 
-log "STEP: Downloading checksum-verified 10Eros beta_5 TAR.ZST from S3"
+MODEL_PACK_READY=0
+if model_pack_ready; then
+  MODEL_PACK_READY=1
+  # A previous attempt may have left the compressed archive behind. Once the
+  # extracted model pack is known-good, remove it before any free-space check.
+  rm -f "$MODEL_ARCHIVE" "$CHECKSUM_FILE" "$MODEL_ARCHIVE.part" "$MODEL_MANIFEST"
+  log "Model pack already ready; skipping S3 download and extraction"
+else
+  # Free any incomplete extracted files before a retry. Keep a complete cached
+  # archive if present; the Python block below will verify it and reuse it.
+  cleanup_partial_current_pack
+
+  if [[ ! -f "$MODEL_ARCHIVE" ]]; then
+    check_disk_space "$MIN_FREE_DISK_GB" "fresh model download"
+  else
+    log "Cached model archive found; verifying it before deciding whether to re-download"
+  fi
+
+  log "STEP: Ensuring checksum-verified 10Eros beta_5 TAR.ZST is available"
 
 python -u - <<'PY'
 from __future__ import annotations
@@ -307,6 +400,14 @@ tmp = archive.with_suffix(archive.suffix + ".part")
 tmp.unlink(missing_ok=True)
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(32 * MIB), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 class Progress:
     def __init__(self, total: int):
         self.total = total
@@ -334,54 +435,69 @@ class Progress:
                 self.last_print = now
 
 
-print(
-    f"[S3] Downloading with {concurrency} workers, {chunk_mib} MiB chunks...",
-    flush=True,
-)
-client.download_file(
-    bucket,
-    model_key,
-    str(tmp),
-    Config=transfer,
-    Callback=Progress(size),
-)
+reuse_archive = False
+if archive.is_file() and archive.stat().st_size == size:
+    print(f"[CACHE] Existing archive found ({archive.stat().st_size / GIB:.2f} GiB); verifying...", flush=True)
+    actual = sha256_file(archive)
+    if actual == expected:
+        print("[CACHE] Existing archive SHA-256 OK; reusing without S3 download", flush=True)
+        reuse_archive = True
+    else:
+        print(f"[CACHE] Existing archive SHA mismatch ({actual}); deleting and re-downloading", flush=True)
+        archive.unlink(missing_ok=True)
 
-print("[SHA256] Verifying downloaded TAR.ZST...", flush=True)
-digest = hashlib.sha256()
-verified = 0
-verify_started = time.monotonic()
-last_verify = 0.0
-
-with tmp.open("rb") as handle:
-    for block in iter(lambda: handle.read(32 * MIB), b""):
-        digest.update(block)
-        verified += len(block)
-        now = time.monotonic()
-        if verified >= size or now - last_verify >= 5.0:
-            elapsed = max(0.001, now - verify_started)
-            pct = verified / size * 100 if size else 0
-            print(
-                f"[SHA256] {pct:6.2f}% | "
-                f"{verified/GIB:6.2f}/{size/GIB:6.2f} GiB | "
-                f"{verified/elapsed/MIB:7.1f} MiB/s",
-                flush=True,
-            )
-            last_verify = now
-
-actual = digest.hexdigest()
-if actual != expected:
-    tmp.unlink(missing_ok=True)
-    raise SystemExit(
-        f"TAR.ZST SHA mismatch: expected {expected}, got {actual}"
+if not reuse_archive:
+    print(
+        f"[S3] Downloading with {concurrency} workers, {chunk_mib} MiB chunks...",
+        flush=True,
+    )
+    client.download_file(
+        bucket,
+        model_key,
+        str(tmp),
+        Config=transfer,
+        Callback=Progress(size),
     )
 
-tmp.replace(archive)
+    print("[SHA256] Verifying downloaded TAR.ZST...", flush=True)
+    digest = hashlib.sha256()
+    verified = 0
+    verify_started = time.monotonic()
+    last_verify = 0.0
+
+    with tmp.open("rb") as handle:
+        for block in iter(lambda: handle.read(32 * MIB), b""):
+            digest.update(block)
+            verified += len(block)
+            now = time.monotonic()
+            if verified >= size or now - last_verify >= 5.0:
+                elapsed = max(0.001, now - verify_started)
+                pct = verified / size * 100 if size else 0
+                print(
+                    f"[SHA256] {pct:6.2f}% | "
+                    f"{verified/GIB:6.2f}/{size/GIB:6.2f} GiB | "
+                    f"{verified/elapsed/MIB:7.1f} MiB/s",
+                    flush=True,
+                )
+                last_verify = now
+
+    actual = digest.hexdigest()
+    if actual != expected:
+        tmp.unlink(missing_ok=True)
+        raise SystemExit(
+            f"TAR.ZST SHA mismatch: expected {expected}, got {actual}"
+        )
+
+    tmp.replace(archive)
+
 print(
     f"Verified artifact: {archive} "
     f"({archive.stat().st_size / GIB:.2f} GiB)",
     flush=True,
 )
 PY
+
+check_disk_space "$MIN_EXTRACT_FREE_GB" "model extraction"
 
 log "STEP: Extracting 10Eros model artifact into /workspace"
 ls -lh "$MODEL_ARCHIVE"
@@ -440,7 +556,12 @@ for label, (path, minimum) in files.items():
 print("All four 10Eros/H3 files are present.")
 PY
 
+mark_model_pack_ready
 rm -f "$MODEL_MANIFEST"
+MODEL_PACK_READY=1
+fi
+
+log "Model pack state: ready=${MODEL_PACK_READY}"
 
 log "Disabling generic ComfyUI services that can conflict with this stack"
 for service in api-wrapper comfyui; do

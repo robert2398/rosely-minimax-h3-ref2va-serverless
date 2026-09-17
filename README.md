@@ -77,7 +77,8 @@ ROSELY_H3_PRESIGNED_URL_EXPIRES_SECONDS=3600
 ROSELY_H3_S3_DOWNLOAD_CONCURRENCY=16
 ROSELY_H3_S3_DOWNLOAD_CHUNK_MIB=64
 
-MIN_FREE_DISK_GB=90
+MIN_FREE_DISK_GB=85
+MIN_EXTRACT_FREE_GB=45
 GENERATION_TIMEOUT_SECONDS=3600
 KEEP_LOCAL_OUTPUTS=false
 COMFYUI_ARGS=
@@ -90,7 +91,7 @@ Keep AWS credentials in Vast secrets. Do not commit them.
 - RTX 5090 32 GB
 - Blackwell-capable PyTorch/CUDA image
 - 64 GB RAM minimum; 96 GB+ preferred
-- 120 GB+ disk
+- 120 GB minimum disk; **150 GB recommended** for retry/debug headroom
 
 The provisioner intentionally rejects non-Blackwell GPUs because the bundled
 Qwen3-VL encoder is NVFP4-AWQ.

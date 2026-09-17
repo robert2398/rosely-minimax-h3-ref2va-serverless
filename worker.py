@@ -9,7 +9,7 @@ from vastai import BenchmarkConfig, HandlerConfig, LogActionConfig, Worker, Work
 
 MODEL_SERVER_URL = "http://127.0.0.1"
 MODEL_SERVER_PORT = 18288
-MODEL_LOG_FILE = "/var/log/portal/comfyui.log"
+MODEL_LOG_FILE = "/var/log/portal/model-server.log"
 MODEL_HEALTHCHECK_ENDPOINT = "/health"
 
 

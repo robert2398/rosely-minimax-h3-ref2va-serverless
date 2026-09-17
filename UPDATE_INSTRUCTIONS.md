@@ -1,48 +1,33 @@
-# 10Eros beta_5 update bundle
+# Apply retry/storage fix
 
-This ZIP contains **drop-in replacement files**, not the 35.7 GiB model bundle.
+Replace these files in the repo:
 
-## Apply
+- `provision.sh`
+- `worker.py`
+- `.env.example`
+- `VAST_TEMPLATE_ARGS.txt`
+- `README.md`
+- `RETRY_STORAGE_FIX.md` (new)
 
-From the root of your local clone:
+Then run:
 
 ```bash
-unzip -o rosely-minimax-h3-10eros-beta5-update.zip -d .
 chmod +x provision.sh
-git status
-git diff -- . ':!UPDATE_INSTRUCTIONS.md'
+git add provision.sh worker.py .env.example VAST_TEMPLATE_ARGS.txt README.md RETRY_STORAGE_FIX.md
+git commit -m "Make Vast H3 provisioning idempotent"
+git push origin main
 ```
 
-Review, then commit:
-
-```bash
-git add \
-  provision.sh \
-  .env.example \
-  VAST_TEMPLATE_ARGS.txt \
-  model_manifest.json \
-  model_server.py \
-  worker.py \
-  test_vast_endpoint.py \
-  workflows/minimax_h3_ref2va_api.json \
-  README.md \
-  README_PATCH.md \
-  notebooks/test_vast_h3_serverless.ipynb
-
-git commit -m "Deploy 10Eros beta5 non-Turbo INT8 bundle on RTX 5090"
-git push
-```
-
-## Important
-
-The updated provisioner expects these already-created S3 objects:
+For the Vast template, use **150 GiB disk** and keep:
 
 ```text
-s3://rosely-infrastructure/models/minimax-h3/10eros-beta5-5090/10eros-beta5-5090-comfyui.tar.zst
-s3://rosely-infrastructure/models/minimax-h3/10eros-beta5-5090/10eros-beta5-5090-comfyui.tar.zst.sha256
+MIN_FREE_DISK_GB=85
+MIN_EXTRACT_FREE_GB=45
 ```
 
-The archive checksum is verified before extraction, and the `model-files.sha256`
-inside the archive is verified after extraction.
+The S3 model keys stay unchanged:
 
-The old ZIP path and HMNSFW LoRA are no longer used.
+```text
+models/minimax-h3/10eros-beta5-5090/10eros-beta5-5090-comfyui.tar.zst
+models/minimax-h3/10eros-beta5-5090/10eros-beta5-5090-comfyui.tar.zst.sha256
+```
