@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import contextlib
 import json
 import logging
 import mimetypes
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -56,7 +58,119 @@ EXPECTED_MODELS = {
 VALID_SCHEDULERS = {"simple", "normal", "beta"}
 VALID_REF_IMAGE_SIZES = {"match", "max"}
 
-app = FastAPI(title="Rosely 10Eros-Max beta_5 MiniMax H3 Ref2VA Server")
+
+# Vast calls /health repeatedly while generation is running. Never synchronously
+# proxy that request into ComfyUI because /system_stats can transiently stall
+# under GPU pressure.
+COMFY_PROBE_INTERVAL_SECONDS = float(
+    os.getenv("COMFY_PROBE_INTERVAL_SECONDS", "10")
+)
+COMFY_PROBE_TIMEOUT_SECONDS = float(
+    os.getenv("COMFY_PROBE_TIMEOUT_SECONDS", "2")
+)
+COMFY_HEALTH_STALE_SECONDS = float(
+    os.getenv("COMFY_HEALTH_STALE_SECONDS", "90")
+)
+
+
+class ComfyHealthState:
+    def __init__(self) -> None:
+        self.ever_ready = False
+        self.last_success_monotonic = 0.0
+        self.last_error: str | None = None
+
+    def mark_success(self) -> None:
+        self.ever_ready = True
+        self.last_success_monotonic = time.monotonic()
+        self.last_error = None
+
+    def mark_failure(self, error: str) -> None:
+        self.last_error = error
+
+    @property
+    def age_seconds(self) -> float | None:
+        if not self.ever_ready:
+            return None
+        return time.monotonic() - self.last_success_monotonic
+
+    @property
+    def healthy(self) -> bool:
+        age = self.age_seconds
+        return (
+            self.ever_ready
+            and age is not None
+            and age < COMFY_HEALTH_STALE_SECONDS
+        )
+
+
+comfy_health = ComfyHealthState()
+
+
+async def comfy_health_monitor() -> None:
+    timeout = httpx.Timeout(
+        connect=1.0,
+        read=COMFY_PROBE_TIMEOUT_SECONDS,
+        write=1.0,
+        pool=1.0,
+    )
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        while True:
+            try:
+                response = await client.get(f"{COMFY_URL}/system_stats")
+                if response.status_code == 200:
+                    comfy_health.mark_success()
+                else:
+                    comfy_health.mark_failure(
+                        f"status={response.status_code}"
+                    )
+                    logger.warning(
+                        "ComfyUI background health probe returned %s; "
+                        "preserving cached healthy state",
+                        response.status_code,
+                    )
+            except Exception as exc:
+                comfy_health.mark_failure(
+                    f"{type(exc).__name__}: {exc}"
+                )
+                logger.warning(
+                    "ComfyUI background health probe failed; "
+                    "preserving cached healthy state. error=%s",
+                    comfy_health.last_error,
+                )
+
+            age = comfy_health.age_seconds
+            if (
+                comfy_health.ever_ready
+                and age is not None
+                and age >= COMFY_HEALTH_STALE_SECONDS
+            ):
+                logger.error(
+                    "ComfyUI has had no successful heartbeat for %.1fs",
+                    age,
+                )
+
+            await asyncio.sleep(COMFY_PROBE_INTERVAL_SECONDS)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    monitor_task = asyncio.create_task(
+        comfy_health_monitor(),
+        name="comfy-health-monitor",
+    )
+    try:
+        yield
+    finally:
+        monitor_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await monitor_task
+
+
+app = FastAPI(
+    title="Rosely 10Eros-Max beta_5 MiniMax H3 Ref2VA Server",
+    lifespan=lifespan,
+)
 generation_lock = asyncio.Lock()
 
 
@@ -381,6 +495,7 @@ async def _submit_and_wait(
                 detail=f"ComfyUI rejected prompt: {response.text}",
             )
 
+        comfy_health.mark_success()
         body = response.json()
         if body.get("error") or body.get("node_errors"):
             raise HTTPException(status_code=502, detail=body)
@@ -398,6 +513,7 @@ async def _submit_and_wait(
                 f"{COMFY_URL}/history/{prompt_id}"
             )
             history_response.raise_for_status()
+            comfy_health.mark_success()
             history = history_response.json()
 
             if prompt_id in history:
@@ -554,50 +670,128 @@ def _upload_and_presign(
     return presigned, bucket, key, expires
 
 
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
+    # Cheap Vast liveness endpoint. Never do live ComfyUI I/O here.
     missing = [
         name
         for name, path in EXPECTED_MODELS.items()
         if not path.is_file()
     ]
 
-    comfy_ok = False
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(f"{COMFY_URL}/system_stats")
-            comfy_ok = response.status_code == 200
-    except Exception:
-        comfy_ok = False
+    bucket = (
+        os.getenv("ROSELY_H3_OUTPUT_BUCKET")
+        or os.getenv("ROSELY_H3_S3_BUCKET")
+    )
+
+    if missing or not bucket:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "unhealthy",
+                "reason": "local prerequisites missing",
+                "missing_models": missing,
+                "s3_output_bucket_configured": bool(bucket),
+            },
+        )
+
+    if not comfy_health.ever_ready:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "starting",
+                "reason": "ComfyUI has not passed its first probe yet",
+            },
+        )
+
+    age = comfy_health.age_seconds
+    if age is not None and age < COMFY_HEALTH_STALE_SECONDS:
+        return {
+            "status": "ok",
+            "model": BASE_MODEL,
+            "profile": "10eros-beta5-non-turbo-int8-5090",
+            "comfyui": "alive",
+            "workflow": WORKFLOW_PATH.name,
+            "s3_output_bucket": bucket,
+            "s3_output_prefix": os.getenv(
+                "ROSELY_H3_OUTPUT_PREFIX",
+                "generated/minimax-h3",
+            ),
+            "last_comfy_success_seconds_ago": round(age, 2),
+            "last_probe_error": comfy_health.last_error,
+        }
+
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "status": "unhealthy",
+            "reason": "ComfyUI heartbeat stale",
+            "last_comfy_success_seconds_ago": (
+                round(age, 2) if age is not None else None
+            ),
+            "last_probe_error": comfy_health.last_error,
+            "stale_after_seconds": COMFY_HEALTH_STALE_SECONDS,
+        },
+    )
+
+
+@app.get("/ready")
+async def ready() -> dict[str, Any]:
+    # Deep diagnostic endpoint. Vast must continue to use /health.
+    missing = [
+        name
+        for name, path in EXPECTED_MODELS.items()
+        if not path.is_file()
+    ]
 
     bucket = (
         os.getenv("ROSELY_H3_OUTPUT_BUCKET")
         or os.getenv("ROSELY_H3_S3_BUCKET")
     )
 
-    if missing or not comfy_ok or not bucket:
+    if missing or not bucket:
         raise HTTPException(
             status_code=503,
             detail={
-                "comfyui": comfy_ok,
+                "status": "not_ready",
                 "missing_models": missing,
                 "s3_output_bucket_configured": bool(bucket),
             },
         )
 
-    return {
-        "status": "ok",
-        "model": BASE_MODEL,
-        "profile": "10eros-beta5-non-turbo-int8-5090",
-        "comfyui": True,
-        "workflow": WORKFLOW_PATH.name,
-        "s3_output_bucket": bucket,
-        "s3_output_prefix": os.getenv(
-            "ROSELY_H3_OUTPUT_PREFIX",
-            "generated/minimax-h3",
-        ),
-    }
+    timeout = httpx.Timeout(
+        connect=1.0,
+        read=5.0,
+        write=1.0,
+        pool=1.0,
+    )
 
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(f"{COMFY_URL}/system_stats")
+            response.raise_for_status()
+
+        comfy_health.mark_success()
+
+        return {
+            "status": "ready",
+            "comfyui": "ready",
+            "model": BASE_MODEL,
+            "workflow": WORKFLOW_PATH.name,
+        }
+
+    except Exception as exc:
+        comfy_health.mark_failure(
+            f"{type(exc).__name__}: {exc}"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "not_ready",
+                "error": comfy_health.last_error,
+            },
+        ) from exc
 
 @app.post("/generate/sync")
 async def generate_sync(envelope: GenerateEnvelope) -> dict[str, Any]:
